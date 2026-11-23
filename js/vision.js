@@ -11,7 +11,7 @@
 // Given 4 src points → 4 dst points, solve for a 3×3 homography H.
 // Then for each dst pixel (x,y) compute src pixel via H_inv and bilinear sample.
 
-function buildHomography(src, dst) {
+export function buildHomography(src, dst) {
   // src, dst: [{x,y}×4] in order TL,TR,BR,BL
   // Returns 9-element Float64Array (row-major 3×3)
   const A = [];
@@ -50,16 +50,17 @@ function gaussSolve8x9(A) {
   return M.map((r, i) => -r[8]);
 }
 
-function applyH(H, x, y) {
+export function applyH(H, x, y) {
   const w = H[6]*x + H[7]*y + H[8];
   return { x: (H[0]*x + H[1]*y + H[2]) / w, y: (H[3]*x + H[4]*y + H[5]) / w };
 }
 
 // Warp src canvas into a new S×S ImageData using homography from dst→src
-function warpPerspective(srcCanvas, corners, S) {
-  const srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true });
-  const srcData = srcCtx.getImageData(0, 0, srcCanvas.width, srcCanvas.height);
-  const srcW = srcCanvas.width, srcH = srcCanvas.height;
+// src: a canvas or an ImageData.
+export function warpPerspective(source, corners, S) {
+  const srcData = source.data ? source
+    : source.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, source.width, source.height);
+  const srcW = srcData.width, srcH = srcData.height;
 
   // Destination corners (top-down square S×S)
   const dstPts = [{ x:0,y:0 }, { x:S,y:0 }, { x:S,y:S }, { x:0,y:S }];
@@ -173,13 +174,18 @@ export class BoardDetector {
 
   // Warp the board and analyse all 64 squares
   // Returns { occupancy[64], colors[64] } or null
-  analyzeFrame(canvas) {
+  // src: canvas or ImageData. Result includes the warped board image.
+  analyzeFrame(src) {
     if (!this._corners) return null;
     const S = this._boardSize;
-    const img = warpPerspective(canvas, this._corners, S);
+    const img = warpPerspective(src, this._corners, S);
     if (!img) return null;
-    return this._analyzeImageData(img, S);
+    const res = this._analyzeImageData(img, S);
+    res.warp = img;
+    return res;
   }
+
+  setBoardSize(S) { this._boardSize = S; }
 
   _analyzeImageData(img, S) {
     const sqSize = S / 8;
@@ -354,7 +360,7 @@ export function expectedFromBoard(boardArray, squareToIndex) {
   return out;
 }
 
-function mismatch(observed, expected) {
+export function mismatch(observed, expected) {
   let s = 0;
   for (let i = 0; i < 64; i++) {
     const o = observed.occupancy[i], e = expected[i];
@@ -364,15 +370,85 @@ function mismatch(observed, expected) {
   return s;
 }
 
-// Returns { base, ranked: [{move, score}] } where base is the mismatch of
+// ─── Change detection ─────────────────────────────────────────────────────
+// Per-square appearance (4×4 luminance cells + chroma) of a canonical warp.
+// Comparing against the frame of the last confirmed position catches pieces
+// whose brightness matches the square (white on light), which occupancy alone
+// misses.
+const DESC = 18;
+export function squareDescriptors(warp) {
+  const S = warp.width, q = S / 8, d = warp.data;
+  const out = new Float32Array(64 * DESC);
+  const m = Math.max(1, Math.round(q * 0.1)), inner = q - 2 * m, cell = inner / 4;
+  for (let i = 0; i < 64; i++) {
+    const ox = (i % 8) * q + m, oy = Math.floor(i / 8) * q + m;
+    let cr = 0, cb = 0, n = 0;
+    for (let cy = 0; cy < 4; cy++) for (let cx = 0; cx < 4; cx++) {
+      let L = 0, k = 0;
+      for (let y = Math.floor(oy + cy * cell); y < Math.floor(oy + (cy + 1) * cell); y++) {
+        for (let x = Math.floor(ox + cx * cell); x < Math.floor(ox + (cx + 1) * cell); x++) {
+          const j = (y * S + x) * 4;
+          L += d[j] * 0.299 + d[j + 1] * 0.587 + d[j + 2] * 0.114;
+          cr += d[j] - d[j + 1]; cb += d[j + 2] - d[j + 1]; k++; n++;
+        }
+      }
+      out[i * DESC + cy * 4 + cx] = k ? L / k : 0;
+    }
+    out[i * DESC + 16] = n ? cr / n : 0;
+    out[i * DESC + 17] = n ? cb / n : 0;
+  }
+  return out;
+}
+
+// → { c: per-square change (64), T: threshold for "really changed" }
+export function descriptorChanges(ref, cur) {
+  const c = new Float32Array(64);
+  for (let i = 0; i < 64; i++) {
+    let s = 0;
+    for (let k = 0; k < 16; k++) s += Math.abs(cur[i * DESC + k] - ref[i * DESC + k]);
+    c[i] = s / 16 + 0.5 * (Math.abs(cur[i * DESC + 16] - ref[i * DESC + 16]) + Math.abs(cur[i * DESC + 17] - ref[i * DESC + 17]));
+  }
+  const med = [...c].sort((a, b) => a - b)[32];
+  return { c, T: Math.max(10, med * 3) };
+}
+
+const CHANGE_WEIGHT = 1.5;
+
+// Cost of a hypothesised position: occupancy/colour mismatch plus, if change
+// info is given, how badly "squares whose contents differ from the reference
+// position" agree with "squares that visibly changed".
+function makeScorer(observed, squareToIndex, change, refBoard) {
+  return (board) => {
+    let s = mismatch(observed, expectedFromBoard(board, squareToIndex));
+    if (!change) return s;
+    const { c, T } = change;
+    const exp = new Uint8Array(64);
+    for (let r = 0; r < 8; r++) for (let f = 0; f < 8; f++) {
+      const a = refBoard[r][f], b = board[r][f];
+      if ((a?.type ?? '') + (a?.color ?? '') !== (b?.type ?? '') + (b?.color ?? '')) {
+        exp[squareToIndex('abcdefgh'[f] + (8 - r))] = 1;
+      }
+    }
+    let cost = 0;
+    for (let i = 0; i < 64; i++) {
+      cost += exp[i] ? Math.min(1, Math.max(0, (T - c[i]) / T)) : Math.min(1, Math.max(0, (c[i] - T) / T));
+    }
+    return s + CHANGE_WEIGHT * cost;
+  };
+}
+
+// Returns { base, ranked: [{move, score}] } where base is the cost of
 // "nothing moved" and ranked is sorted best-first.
-export function matchMove(observed, chess, squareToIndex) {
-  const base = mismatch(observed, expectedFromBoard(chess.board(), squareToIndex));
+// change (optional): descriptorChanges() against the frame of the current position.
+export function matchMove(observed, chess, squareToIndex, change = null) {
+  const refBoard = chess.board();
+  const score = makeScorer(observed, squareToIndex, change, refBoard);
+  const base = score(refBoard);
   const ranked = [];
   for (const m of chess.moves({ verbose: true })) {
     if (m.promotion && m.promotion !== 'q') continue;
     chess.move({ from: m.from, to: m.to, promotion: m.promotion });
-    ranked.push({ move: m, score: mismatch(observed, expectedFromBoard(chess.board(), squareToIndex)) });
+    ranked.push({ move: m, score: score(chess.board()) });
     chess.undo();
   }
   ranked.sort((a, b) => a.score - b.score);
@@ -401,6 +477,33 @@ export function decideMove({ base, ranked }) {
   const tied = ranked.filter(r => r.score - best.score < 0.5);
   if (tied.length === 1) return { kind: 'move', move: best.move };
   return { kind: 'ambiguous', candidates: tied.slice(0, 4).map(r => r.move) };
+}
+
+// Recovery when a move was missed: find a move + reply pair that explains the
+// frame clearly better than any single move. Returns [m1, m2] or null.
+export function matchTwoPly(observed, chess, squareToIndex, change = null) {
+  const refBoard = chess.board();
+  const score = makeScorer(observed, squareToIndex, change, refBoard);
+  const base = score(refBoard);
+  let single = Infinity;
+  const pairs = [];
+  for (const m1 of chess.moves({ verbose: true })) {
+    if (m1.promotion && m1.promotion !== 'q') continue;
+    chess.move({ from: m1.from, to: m1.to, promotion: m1.promotion });
+    single = Math.min(single, score(chess.board()));
+    for (const m2 of chess.moves({ verbose: true })) {
+      if (m2.promotion && m2.promotion !== 'q') continue;
+      chess.move({ from: m2.from, to: m2.to, promotion: m2.promotion });
+      pairs.push({ m1, m2, score: score(chess.board()) });
+      chess.undo();
+    }
+    chess.undo();
+  }
+  pairs.sort((a, b) => a.score - b.score);
+  const [best, second] = pairs;
+  if (!best || best.score > base - 2.6 || best.score > single - 1.3) return null;
+  if (second && second.score - best.score < 0.5) return null;
+  return [best.m1, best.m2];
 }
 
 // ─── Camera Manager ──────────────────────────────────────────────────────────
@@ -434,6 +537,17 @@ export class CameraManager {
     this._canvas.height = Math.round(vh * scale);
     return this;
   }
+
+  // Downscaled frame as a transferable ImageBitmap (for the vision worker).
+  bitmap(width = 640) {
+    if (!this.ready) return null;
+    const vw = this._video.videoWidth, vh = this._video.videoHeight;
+    return createImageBitmap(this._video, {
+      resizeWidth: width, resizeHeight: Math.round((width * vh) / vw), resizeQuality: 'medium',
+    });
+  }
+
+  get label() { return this._stream?.getVideoTracks()[0]?.label ?? ''; }
 
   grab() {
     if (!this.ready) return null;

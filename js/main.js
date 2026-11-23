@@ -224,6 +224,7 @@ async function onMoveConfirmed(_move) {
 
   const isPlayerTurn = state.game.turn() === state.playerColor;
   state.xr?.clearArrow('best');
+  state.modeInstance?.setHintArrow?.(null);
   state.desktopBoard?.clearArrow();
   const el = document.getElementById('desktop-move-hint');
   if (el) el.textContent = '';
@@ -247,6 +248,7 @@ async function requestEngineHint() {
     const from = move.slice(0, 2);
     const to = move.slice(2, 4);
     state.xr?.showArrow(from, to);
+    state.modeInstance?.setHintArrow?.(from, to);
     state.desktopBoard?.setArrow(from, to);
     updateDesktopBoard();
     updateMoveHintUI(move, score);

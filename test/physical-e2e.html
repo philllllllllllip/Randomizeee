@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Physical mode e2e</title>
+  <style>html,body{margin:0;background:#222}</style>
+  <script type="importmap">
+  { "imports": {
+      "three": "../js/vendor/three/build/three.module.min.js",
+      "three/addons/": "../js/vendor/three/examples/jsm/" } }
+  </script>
+  <script src="../js/lib/chess.js"></script>
+</head>
+<body>
+<script type="module">
+// "World" renders a real-looking board on a table = the passthrough camera.
+// "App" is the real PhysicalBoardMode with its own XRSession, given nothing
+// but camera frames. Nobody tells it where the board is.
+import * as THREE from 'three';
+import { XRSession } from '../js/xr.js';
+import { ChessGame } from '../js/game.js';
+import { PhysicalBoardMode } from '../js/modes/physical.js';
+import { setToastSink } from '../js/ui.js';
+
+const world = await new XRSession().init();
+const app = await new XRSession().init();
+world.renderer.domElement.style.display = 'block';
+const log = [];
+setToastSink((m) => log.push(m));
+
+const c = document.createElement('canvas'); c.width = c.height = 512;
+const x = c.getContext('2d');
+x.fillStyle = '#6b4a2e'; x.fillRect(0, 0, 512, 512);
+for (let i = 0; i < 4000; i++) {
+  x.fillStyle = `rgba(${40 + Math.random() * 60},${25 + Math.random() * 40},10,${Math.random() * 0.35})`;
+  x.fillRect(Math.random() * 512, Math.random() * 512, 1 + Math.random() * 30, 1 + Math.random() * 2);
+}
+const table = new THREE.Mesh(new THREE.PlaneGeometry(1.6, 1.2), new THREE.MeshStandardMaterial({ map: new THREE.CanvasTexture(c) }));
+table.rotation.x = -Math.PI / 2;
+table.position.set(0, 0.7385, -0.35);
+world.scene.add(table);
+world._hudMesh.visible = false;
+
+window.run = async (sans, { eye = [0, 1.25, 0.05], yawDeg = 0, color = 'w', hand = true, resync = true } = {}) => {
+  const truth = new Chess();
+  world.setStyle('virtual');
+  world.whiteAtBottom = true;
+  const yaw = (yawDeg * Math.PI) / 180 + (color === 'b' ? Math.PI : 0);
+  world.lockBoard({ center: new THREE.Vector3(0, 0.75, -0.35), yaw, size: 0.4 });
+  world.setPieces(truth.board());
+  for (const cam of [world.camera, app.camera]) {
+    cam.position.set(...eye);
+    cam.lookAt(0, 0.75, -0.35);
+    cam.updateMatrixWorld();
+  }
+  app.tableY = 0.75;
+
+  // A blob standing in for a hand reaching over the board mid-move.
+  const handMesh = new THREE.Mesh(new THREE.SphereGeometry(0.07, 16, 12), new THREE.MeshStandardMaterial({ color: 0xd9a07a }));
+  handMesh.visible = false;
+  world.scene.add(handMesh);
+
+  const camera = {
+    ready: true,
+    bitmap: (w = 640) => {
+      world.renderer.render(world.scene, world.camera);
+      return createImageBitmap(world.renderer.domElement, { resizeWidth: w, resizeHeight: Math.round(w * 9 / 16) });
+    },
+  };
+  const game = new ChessGame().init();
+  const mode = new PhysicalBoardMode(game, null, app, () => {}, camera);
+  mode.start({ playerColor: color });
+
+  const tick = async (n = 1) => {
+    for (let i = 0; i < n; i++) {
+      await mode._submit();
+      const t0 = performance.now();
+      while (mode._busy && performance.now() - t0 < 5000) await new Promise(r => setTimeout(r, 5));
+    }
+  };
+
+  const t0 = performance.now();
+  let frames = 0;
+  while (mode._state !== 'tracking' && frames < 20) { await tick(); frames++; }
+  const lockFrames = frames, lockMs = performance.now() - t0;
+  if (mode._state !== 'tracking') { mode.stop(); return { locked: false, log }; }
+
+  const corners = app.boardCornersWorld(), truthC = world.boardCornersWorld();
+  const overlayErrCm = Math.max(...corners.map((p, k) => p.distanceTo(truthC[k]))) * 100;
+
+  const rows = [];
+  for (const san of sans) {
+    const mv = truth.move(san);
+    if (hand) {
+      const p = world.boardCornersWorld()[0].clone().lerp(world.boardCornersWorld()[2], 0.5);
+      handMesh.position.set(p.x, 0.86, p.z);
+      handMesh.visible = true;
+      world.setPieces(new Chess(truth.fen()).board()); // piece already moved under the hand
+      await tick(2);
+      handMesh.visible = false;
+    }
+    world.setPieces(truth.board());
+    const before = game.moveHistory().length;
+    let k = 0;
+    while (game.moveHistory().length <= before && k < 8) { await tick(); k++; }
+    const got = game.moveHistory().slice(before).map(m => m.san);
+    rows.push({ san, got, frames: k });
+    // keep in sync if it missed or guessed wrong (like a player pressing undo / trigger)
+    if (resync && game.fen() !== truth.fen()) game.loadFen(truth.fen());
+  }
+  const workerUsed = !!mode._worker;
+  mode.stop();
+  handMesh.removeFromParent();
+  const finalOk = game.fen().split(' ')[0] === truth.fen().split(' ')[0];
+  return { finalOk, locked: true, lockFrames, lockMs, overlayErrCm, rows, workerUsed, log: log.slice(-3) };
+};
+window.composite = async () => {
+  const truth = new Chess();
+  for (const m of ['e4', 'e5', 'Nf3']) truth.move(m);
+  world.setStyle('virtual'); world.whiteAtBottom = true;
+  world.lockBoard({ center: new THREE.Vector3(0, 0.75, -0.35), yaw: 0.3, size: 0.4 });
+  world.setPieces(new Chess().board());
+  for (const cam of [world.camera, app.camera]) { cam.position.set(0, 1.3, 0.1); cam.lookAt(0, 0.85, -0.45); cam.updateMatrixWorld(); }
+  app.tableY = 0.75;
+  const camera = { ready: true, bitmap: (w = 640) => { world.renderer.render(world.scene, world.camera);
+    return createImageBitmap(world.renderer.domElement, { resizeWidth: w, resizeHeight: 360 }); } };
+  const game = new ChessGame().init();
+  const mode = new PhysicalBoardMode(game, null, app, () => {}, camera);
+  mode.start({ playerColor: 'w' });
+  const tick = async () => { await mode._submit(); while (mode._busy) await new Promise(r => setTimeout(r, 5)); };
+  for (let i = 0; i < 3; i++) await tick();
+  for (const m of ['e4', 'e5', 'Nf3']) {
+    const t = new Chess(); for (const x of truth.history().slice(0, truth.history().indexOf(m) + 1)) t.move(x);
+    world.setPieces(t.board()); for (let i = 0; i < 4; i++) await tick();
+  }
+  app.showArrow('f8', 'c5');
+  mode.setHintArrow('f8', 'c5');
+  app.setHud({ hint: 'Best move: f8 → c5   +0.3' });
+  world.renderer.render(world.scene, world.camera);
+  app.renderer.domElement.style.display = 'block';
+  app.renderer.render(app.scene, app.camera);
+  return game.moveHistory().map(m => m.san);
+};
+window.ready = true;
+</script>
+</body>
+</html>

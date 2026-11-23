@@ -24,6 +24,10 @@ export class XRSession {
     this._hud = { title: '', status: '', hint: '', controls: '' };
     this._buttonState = [{}, {}];
     this._hoverOwner = -1;
+    this.tableY = 0.74; // metres above the floor; refined by WebXR hit-test
+    this._hitSource = null;
+    this._minimap = null;
+    this._ovl = null;
   }
 
   async init() {
@@ -67,10 +71,27 @@ export class XRSession {
     if (!navigator.xr) throw new Error('WebXR not available');
     const session = await navigator.xr.requestSession('immersive-ar', {
       requiredFeatures: ['local-floor'],
-      optionalFeatures: ['hand-tracking'],
+      optionalFeatures: ['hand-tracking', 'hit-test'],
     });
     await this._renderer.xr.setSession(session);
+    // Hit-test along the gaze finds the table surface (from the room scan).
+    try {
+      const viewer = await session.requestReferenceSpace('viewer');
+      this._hitSource = await session.requestHitTestSource({ space: viewer });
+    } catch { this._hitSource = null; }
+    session.addEventListener('end', () => { this._hitSource = null; });
     return session;
+  }
+
+  _updateTableHeight(frame) {
+    if (!frame || !this._hitSource) return;
+    const ref = this._renderer.xr.getReferenceSpace();
+    const hit = frame.getHitTestResults(this._hitSource)[0];
+    const y = hit?.getPose(ref)?.transform.position.y;
+    if (y == null) return;
+    const eyeY = this.getViewer().pos.y;
+    // Only surfaces that look like a table, not the floor or a wall.
+    if (y > 0.3 && y < eyeY - 0.2) this.tableY += (y - this.tableY) * 0.1;
   }
 
   async exitAR() {
@@ -87,6 +108,7 @@ export class XRSession {
       n++;
       this._pollButtons();
       this._updateLasers();
+      this._updateTableHeight(frame);
       for (const cb of this._frameCbs) cb(time, frame, n);
       this._renderer.render(this._scene, this._camera);
     });
@@ -394,6 +416,47 @@ export class XRSession {
     );
   }
 
+  // Camera-image pixels → points on the table plane, by casting rays from the
+  // left-eye camera (stand-in for the passthrough camera, whose intrinsics
+  // the web cannot read).
+  imageToTable(points, W, H) {
+    const xrCam = this._renderer.xr.isPresenting ? this._renderer.xr.getCamera() : null;
+    const cam = xrCam?.cameras?.[0] ?? this._camera;
+    cam.updateMatrixWorld();
+    const origin = new THREE.Vector3().setFromMatrixPosition(cam.matrixWorld);
+    return points.map((p) => {
+      const dir = new THREE.Vector3((p.x / W) * 2 - 1, 1 - (p.y / H) * 2, 0.5).unproject(cam).sub(origin).normalize();
+      if (dir.y > -1e-3) return null;
+      return origin.clone().addScaledVector(dir, (this.tableY - origin.y) / dir.y);
+    });
+  }
+
+  // Place the overlay from world corners [a8, h8, h1, a1], low-pass filtered
+  // because the real board is static and the estimate jitters with the head.
+  placeBoardFromCorners(w) {
+    if (w.some(p => !p)) return false;
+    const x = w[1].clone().sub(w[0]).add(w[2].clone().sub(w[3])).multiplyScalar(0.5);
+    const z = w[3].clone().sub(w[0]).add(w[2].clone().sub(w[1])).multiplyScalar(0.5);
+    const size = (Math.hypot(x.x, x.z) + Math.hypot(z.x, z.z)) / 2;
+    if (size < 0.15 || size > 1.2) return false;
+    const center = w.reduce((a, p) => a.add(p), new THREE.Vector3()).multiplyScalar(0.25);
+    const yaw = Math.atan2(-x.z, x.x);
+    this.whiteAtBottom = true; // corners are labelled, so mapping is canonical
+    const o = this._ovl;
+    if (!o || o.center.distanceTo(center) > 0.12) {
+      this._ovl = { center, yaw, size };
+    } else {
+      const k = 0.2;
+      o.center.lerp(center, k);
+      o.yaw += Math.atan2(Math.sin(yaw - o.yaw), Math.cos(yaw - o.yaw)) * k;
+      o.size += (size - o.size) * k;
+    }
+    this._setBoardTransform(this._ovl.center, this._ovl.yaw, this._ovl.size, 0);
+    return true;
+  }
+
+  resetOverlay() { this._ovl = null; this.hideBoard(); }
+
   // Board-centre → viewer direction in board-local XZ (= warped image x/y axes).
   viewerDirOnBoard() {
     const { pos } = this.getViewer();
@@ -506,7 +569,7 @@ export class XRSession {
     this._hudTex = new THREE.CanvasTexture(canvas);
     this._hudTex.colorSpace = THREE.SRGBColorSpace;
     this._hudMesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(0.5, 0.5 * (420 / 1024)),
+      new THREE.PlaneGeometry(0.56, 0.56 * (420 / 1024)),
       new THREE.MeshBasicMaterial({ map: this._hudTex, transparent: true, depthTest: false })
     );
     this._hudMesh.renderOrder = 10;
@@ -547,6 +610,84 @@ export class XRSession {
     this._drawHud();
   }
 
+  // Live top-down view of the detected board in the HUD.
+  // m: { warp: {width,height,data}, occupancy, colors, arrow, last, blackView } | null
+  setMinimap(m) {
+    this._minimap = m;
+    if (m?.warp) {
+      this._mmCanvas ??= document.createElement('canvas');
+      this._mmCanvas.width = m.warp.width;
+      this._mmCanvas.height = m.warp.height;
+      this._mmCanvas.getContext('2d').putImageData(new ImageData(m.warp.data, m.warp.width, m.warp.height), 0, 0);
+    }
+    this._drawHud();
+  }
+
+  _drawMinimap(ctx, X, Y, S) {
+    const m = this._minimap;
+    ctx.save();
+    ctx.fillStyle = '#000';
+    ctx.fillRect(X, Y, S, S);
+    const flip = !!m.blackView;
+    if (m.warp && this._mmCanvas) {
+      ctx.save();
+      if (flip) { ctx.translate(X + S, Y + S); ctx.rotate(Math.PI); ctx.drawImage(this._mmCanvas, 0, 0, S, S); }
+      else ctx.drawImage(this._mmCanvas, X, Y, S, S);
+      ctx.restore();
+    }
+    const q = S / 8;
+    const pos = (sq) => {
+      let c = 'abcdefgh'.indexOf(sq[0]), r = 8 - +sq[1];
+      if (flip) { c = 7 - c; r = 7 - r; }
+      return { x: X + (c + 0.5) * q, y: Y + (r + 0.5) * q };
+    };
+    if (m.last) for (const sq of [m.last.from, m.last.to]) {
+      const p = pos(sq);
+      ctx.fillStyle = 'rgba(255,225,74,0.45)';
+      ctx.fillRect(p.x - q / 2, p.y - q / 2, q, q);
+    }
+    ctx.strokeStyle = 'rgba(74,168,255,0.9)';
+    ctx.lineWidth = 2;
+    for (let k = 0; k <= 8; k++) {
+      ctx.beginPath(); ctx.moveTo(X + k * q, Y); ctx.lineTo(X + k * q, Y + S); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(X, Y + k * q); ctx.lineTo(X + S, Y + k * q); ctx.stroke();
+    }
+    if (m.occupancy) {
+      for (let i = 0; i < 64; i++) {
+        if (!m.occupancy[i]) continue;
+        const p = pos('abcdefgh'[i % 8] + (8 - Math.floor(i / 8)));
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, q * 0.16, 0, Math.PI * 2);
+        ctx.fillStyle = m.colors?.[i] === 'w' ? '#fff' : '#111';
+        ctx.fill();
+        ctx.strokeStyle = m.colors?.[i] === 'w' ? '#111' : '#fff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+    }
+    if (m.arrow) {
+      const a = pos(m.arrow.from), b = pos(m.arrow.to);
+      const ang = Math.atan2(b.y - a.y, b.x - a.x);
+      ctx.strokeStyle = ctx.fillStyle = m.arrow.color ?? '#ff9500';
+      ctx.lineWidth = q * 0.16;
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x - Math.cos(ang) * q * 0.35, b.y - Math.sin(ang) * q * 0.35); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(b.x, b.y);
+      ctx.lineTo(b.x - Math.cos(ang - 0.5) * q * 0.5, b.y - Math.sin(ang - 0.5) * q * 0.5);
+      ctx.lineTo(b.x - Math.cos(ang + 0.5) * q * 0.5, b.y - Math.sin(ang + 0.5) * q * 0.5);
+      ctx.fill();
+    }
+    ctx.fillStyle = '#cfe6ff';
+    ctx.font = `bold ${Math.round(q * 0.3)}px sans-serif`;
+    for (let k = 0; k < 8; k++) {
+      ctx.fillText(flip ? 'hgfedcba'[k] : 'abcdefgh'[k], X + k * q + 3, Y + S - q * 0.32);
+      ctx.fillText(String(flip ? k + 1 : 8 - k), X + 3, Y + k * q + 3);
+    }
+    ctx.restore();
+  }
+
   _drawHud() {
     const ctx = this._hudCanvas.getContext('2d');
     const W = this._hudCanvas.width, H = this._hudCanvas.height;
@@ -559,25 +700,31 @@ export class XRSession {
     roundRect(ctx, 2, 2, W - 4, H - 4, 34);
     ctx.stroke();
 
+    let X = 36;
+    if (this._minimap) {
+      this._drawMinimap(ctx, 24, 24, H - 48);
+      X = H + 4;
+    }
+    const TW = W - X - 36;
     ctx.textBaseline = 'top';
     ctx.fillStyle = '#8fc6ff';
     ctx.font = 'bold 34px sans-serif';
-    ctx.fillText(this._hud.title || 'Board Coach XR', 36, 24);
+    ctx.fillText(this._hud.title || 'Board Coach XR', X, 24);
 
     ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 44px sans-serif';
-    let y = wrapText(ctx, this._hud.status || '', 36, 76, W - 72, 52, 3);
+    ctx.font = `bold ${this._minimap ? 38 : 44}px sans-serif`;
+    let y = wrapText(ctx, this._hud.status || '', X, 76, TW, this._minimap ? 46 : 52, 4);
 
     if (this._hud.hint) {
       ctx.fillStyle = '#ffb347';
-      ctx.font = 'bold 42px sans-serif';
-      y = wrapText(ctx, this._hud.hint, 36, y + 8, W - 72, 50, 1);
+      ctx.font = 'bold 40px sans-serif';
+      y = wrapText(ctx, this._hud.hint, X, y + 8, TW, 48, 2);
     }
 
     if (this._hud.controls) {
       ctx.fillStyle = '#a9b0c4';
       ctx.font = '27px sans-serif';
-      wrapText(ctx, this._hud.controls, 36, Math.max(y + 12, H - 110), W - 72, 33, 3);
+      wrapText(ctx, this._hud.controls, X, Math.max(y + 12, H - 110), TW, 33, 3);
     }
     this._hudTex.needsUpdate = true;
   }

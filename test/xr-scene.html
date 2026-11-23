@@ -121,6 +121,78 @@ window.visionGame = (sans, viewY = 1.25, viewZ = 0.05) => {
   return { calibrated, startBase, rows, msPerFrame: t / sans.length, debug: window.__debug };
 };
 
+// Auto-detect end-to-end: nothing is told where the board is.
+import { BoardFinder, canonicalIndex } from '../js/boardfind.js';
+let table = null;
+function addTable() {
+  if (table) return;
+  const c = document.createElement('canvas'); c.width = c.height = 512;
+  const x = c.getContext('2d');
+  x.fillStyle = '#6b4a2e'; x.fillRect(0, 0, 512, 512);
+  for (let i = 0; i < 4000; i++) {
+    x.fillStyle = `rgba(${40 + Math.random() * 60},${25 + Math.random() * 40},10,${Math.random() * 0.35})`;
+    x.fillRect(Math.random() * 512, Math.random() * 512, 1 + Math.random() * 30, 1 + Math.random() * 2);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  table = new THREE.Mesh(new THREE.PlaneGeometry(1.6, 1.2), new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9 }));
+  table.rotation.x = -Math.PI / 2;
+  table.position.set(0, 0.7385, -0.35);
+  xr.scene.add(table);
+}
+
+window.autoGame = (sans, { viewY = 1.25, viewZ = 0.05, yawDeg = 0, black = false } = {}) => {
+  addTable();
+  xr._hudMesh.visible = false;
+  xr.clearHighlights(); xr.clearArrows();
+  xr.setStyle('virtual');
+  xr.whiteAtBottom = true;
+  const yaw = (yawDeg * Math.PI) / 180 + (black ? Math.PI : 0);
+  xr.lockBoard({ center: new THREE.Vector3(0, 0.75, -0.35), yaw, size: 0.4 });
+  look(new THREE.Vector3(0, viewY, viewZ), new THREE.Vector3(0, 0.75, -0.35));
+  const frame = document.createElement('canvas');
+  frame.width = 640; frame.height = 360;
+  const fctx = frame.getContext('2d', { willReadFrequently: true });
+  const grab = (board) => {
+    xr.setPieces(board);
+    xr.renderer.render(xr.scene, cam);
+    fctx.drawImage(xr.renderer.domElement, 0, 0, 640, 360);
+    return fctx.getImageData(0, 0, 640, 360);
+  };
+  const truthCorners = () => xr.projectBoardToImage(640, 360); // [a8,h8,h1,a1] since whiteAtBottom
+  const finder = new BoardFinder();
+  const truth = new Chess(), game = new Chess();
+  const exp = (c) => expectedFromBoard(c.board(), canonicalIndex);
+  const cornerErr = (res) => res.found
+    ? Math.max(...res.corners.map((p, k) => Math.hypot(p.x - truthCorners()[k].x, p.y - truthCorners()[k].y))) : null;
+
+  let t0 = performance.now();
+  const lock = finder.process(grab(truth.board()), exp(truth));
+  const lockMs = performance.now() - t0;
+  const out = { lock: { bestScore: lock.bestScore, found: lock.found, nCorners: lock.nCorners, lattice: lock.lattice, err: cornerErr(lock), ms: lockMs }, rows: [] };
+  if (!lock.found) return out;
+  let ms = 0;
+  for (const san of sans) {
+    truth.move(san);
+    const img = grab(truth.board());
+    t0 = performance.now();
+    const res = finder.process(img, exp(game));
+    ms += performance.now() - t0;
+    let outcome;
+    if (!res.found) outcome = 'board-lost';
+    else {
+      const d = decideMove(matchMove(res, game, canonicalIndex));
+      if (d.kind === 'move' && d.move.san === san) outcome = 'auto';
+      else if (d.kind === 'ambiguous' && d.candidates.some(m => m.san === san)) outcome = 'groq';
+      else if (d.kind === 'move') outcome = 'WRONG:' + d.move.san;
+      else outcome = 'missed:' + d.kind;
+    }
+    out.rows.push({ san, outcome, err: cornerErr(res) });
+    game.move(san);
+  }
+  out.msPerFrame = ms / sans.length;
+  return out;
+};
+
 window.ready = true;
 </script>
 </body>
