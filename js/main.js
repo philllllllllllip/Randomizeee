@@ -70,13 +70,7 @@ async function boot() {
     showToast('Engine unavailable — playing without hints', 4000, 'warn');
   }
 
-  setProgress(60, 'Loading OpenCV.js…');
-  try {
-    await loadOpenCV((msg) => setProgress(70, msg));
-  } catch (err) {
-    console.warn('OpenCV load failed:', err);
-    showToast('Vision pipeline unavailable — physical mode limited', 4000, 'warn');
-  }
+  setProgress(70, 'Vision ready');
 
   setProgress(85, 'Setting up XR…');
   const xr = new XRSession();
