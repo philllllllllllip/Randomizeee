@@ -2,8 +2,5 @@ name = "board-coach-xr"
 compatibility_date = "2024-11-01"
 pages_build_output_dir = "."
 
-[build]
-command = ""
-
 # Secrets (set via Cloudflare dashboard or wrangler secret put):
 #   GROQ_API_KEY  — Groq API key (never commit the value)
