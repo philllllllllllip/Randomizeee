@@ -2,38 +2,100 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Randomizeee</title>
-  <link rel="stylesheet" href="style.css" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#0a0a0f" />
+  <title>Board Coach XR</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/"
+    }
+  }
+  </script>
 </head>
 <body>
-  <div id="app">
-    <header>
-      <h1 id="logo">Randomizeee</h1>
-      <p id="tagline">nothing here is decided by you</p>
-    </header>
+  <!-- Loading screen -->
+  <div id="loading-screen">
+    <div class="loader-inner">
+      <div class="loader-logo">♟</div>
+      <div class="loader-title">Board Coach XR</div>
+      <div class="loader-bar"><div class="loader-fill" id="loader-fill"></div></div>
+      <div class="loader-status" id="loader-status">Initializing…</div>
+    </div>
+  </div>
 
-    <main>
-      <div id="output-wrapper">
-        <div id="output-box">
-          <span id="output-label">your string</span>
-          <p id="output-string">???</p>
+  <!-- Landing UI (non-XR) -->
+  <div id="landing" class="hidden">
+    <div class="landing-inner">
+      <h1>♟ Board Coach XR</h1>
+      <p class="subtitle">Mixed-reality chess coach for Meta Quest 3S</p>
+
+      <div class="mode-cards">
+        <div class="mode-card" id="btn-physical">
+          <div class="mode-icon">📷</div>
+          <h2>Physical Board</h2>
+          <p>Place your real chess set in passthrough. Camera detects moves automatically.</p>
+          <button class="btn-primary">Start AR</button>
+        </div>
+        <div class="mode-card" id="btn-manual">
+          <div class="mode-icon">🕹️</div>
+          <h2>Manual Board</h2>
+          <p>Virtual floating board. Enter moves with the controller trigger. No camera needed.</p>
+          <button class="btn-primary">Start AR</button>
         </div>
       </div>
 
-      <div id="meta-info">
-        <span class="meta-chip" id="meta-length">length: —</span>
-        <span class="meta-chip" id="meta-case">case: —</span>
-        <span class="meta-chip" id="meta-charset">charset: —</span>
-        <span class="meta-chip" id="meta-font">font: —</span>
+      <div class="settings-row">
+        <label>Play as
+          <select id="color-select">
+            <option value="w">White</option>
+            <option value="b">Black</option>
+          </select>
+        </label>
+        <label>Engine depth
+          <select id="depth-select">
+            <option value="12">12</option>
+            <option value="15" selected>15</option>
+            <option value="18">18</option>
+            <option value="20">20</option>
+          </select>
+        </label>
       </div>
 
-      <button id="generate-btn">generate</button>
-
-      <div id="copy-toast">copied!</div>
-    </main>
+      <div id="browser-warning" class="hidden">
+        <p>⚠️ WebXR not supported in this browser. Use Meta Quest Browser or a WebXR-capable browser.</p>
+      </div>
+    </div>
   </div>
 
-  <script src="script.js"></script>
+  <!-- Non-XR fallback HUD (desktop testing) -->
+  <div id="desktop-hud" class="hidden">
+    <div id="desktop-board-wrap">
+      <canvas id="desktop-board" width="480" height="480"></canvas>
+    </div>
+    <div id="desktop-controls">
+      <div id="desktop-fen-display"></div>
+      <div id="desktop-move-hint"></div>
+      <button id="btn-undo">↩ Undo</button>
+      <button id="btn-new-game">New Game</button>
+      <button id="btn-flip">Flip</button>
+      <label>FEN: <input id="fen-input" placeholder="paste FEN…" /></label>
+      <button id="btn-load-fen">Load</button>
+      <div id="promotion-panel" class="hidden">
+        <span>Promote to: </span>
+        <button class="promo-btn" data-piece="q">♛</button>
+        <button class="promo-btn" data-piece="r">♜</button>
+        <button class="promo-btn" data-piece="b">♝</button>
+        <button class="promo-btn" data-piece="n">♞</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- XR overlay canvas for 2D HUD in XR -->
+  <canvas id="xr-hud" class="hidden"></canvas>
+
+  <script type="module" src="js/main.js"></script>
 </body>
 </html>
