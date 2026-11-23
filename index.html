@@ -6,12 +6,12 @@
   <meta name="theme-color" content="#0a0a0f" />
   <title>Board Coach XR</title>
   <link rel="stylesheet" href="styles.css" />
-  <!-- importmap: only resolved when xr.js is dynamically imported (not on boot) -->
+  <!-- Three.js r165 is self-hosted; only fetched when xr.js is imported -->
   <script type="importmap">
   {
     "imports": {
-      "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
-      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/"
+      "three": "./js/vendor/three/build/three.module.min.js",
+      "three/addons/": "./js/vendor/three/examples/jsm/"
     }
   }
   </script>

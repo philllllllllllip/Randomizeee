@@ -1,257 +1,265 @@
-// Physical Board Mode
-// Uses WebXR passthrough + camera vision to detect chess moves automatically
+// Physical Board Mode — overlay locked onto a real board seen in passthrough.
 //
-// Flow:
-//   1. Enter AR mode
-//   2. Controller trigger-drag to mark board corners (TL → BR)
-//   3. Board locks in; vision pipeline starts scanning
-//   4. Auto-detect moves, validate with chess.js
-//   5. Ambiguous moves → Groq disambiguation → controller confirm
+//   1. Touch the controller tip to one board corner, hold trigger, drag to the
+//      opposite corner, release → overlay locks onto the real board.
+//   2. The first camera frame is used to calibrate empty/white/black squares
+//      against the known position.
+//   3. Each stable frame is scored against every legal move (vision.matchMove).
+//      Clear winner → played. Tie → Groq suggests, grip accepts.
+//   4. The trigger can always enter a move by hand (camera-less fallback).
+//
+// Camera frames never leave the device; only FEN + candidate moves go to Groq.
 
-import { BoardDetector, CameraManager } from '../vision.js';
+import { BoardDetector, matchMove, decideMove, expectedFromBoard } from '../vision.js';
 import { rankCandidateMoves } from '../groq.js';
 import { showToast } from '../ui.js';
+import { MovePicker } from './picker.js';
+
+const PLACE_HELP =
+  'Set up your pieces, touch the controller tip to one corner of the real board, ' +
+  'HOLD trigger, drag to the opposite corner, release.';
+const SCAN_CONTROLS =
+  'Moves auto-detect · Trigger: enter a move yourself · Grip: rescan / accept suggestion · ' +
+  'A/X: undo · B/Y: re-mark board · Stick ←/→: rotate overlay · Stick click: switch side';
+const FRAME_EVERY = 10;
+const STABLE_FRAMES = 3;
 
 export class PhysicalBoardMode {
-  constructor(game, engine, xrSession, onMoveConfirmed) {
+  constructor(game, engine, xr, onMoveConfirmed, camera = null) {
     this._game = game;
-    this._engine = engine;
-    this._xr = xrSession;
+    this._xr = xr;
     this._onMoveConfirmed = onMoveConfirmed;
-
+    this._camera = camera;
     this._detector = new BoardDetector();
-    this._camera = new CameraManager();
-    this._active = false;
-    this._state = 'idle'; // idle | placing | scanning | ambiguous | paused
-    this._cornerDragStart = null; // {x,y} in screen space
-    this._cornerDragController = null;
-    this._pendingCandidates = [];
-    this._occlusionCounter = 0;
-    this._maxOcclusion = 10; // frames of allowed occlusion
-    this._frameInterval = 8; // process every N frames for performance
-    this._frameCount = 0;
-    this._lastOccupancy = null;
-    this._whiteAtBottom = true;
-    this._scanTimeout = null;
-    this._gripRequestedRescan = false;
+    this._picker = new MovePicker(game, xr, (move) => this._afterMove(move, 'entered'));
+    this._picker.extraHighlights = () => this._drawCandidates();
+    this._state = 'placing';
+    this._drag = null;
+    this._prevOcc = null;
+    this._stable = 0;
+    this._pausedUntil = 0;
+    this._pending = null; // {candidates, suggestion}
+    this._warnedUnreadable = false;
   }
 
-  async start(options = {}) {
-    this._whiteAtBottom = (options.playerColor ?? 'w') === 'w';
-    this._active = true;
-    this._state = 'placing';
+  start({ playerColor = 'w' } = {}) {
+    const xr = this._xr;
+    xr.whiteAtBottom = playerColor === 'w';
+    xr.setStyle('overlay');
+    xr.hideBoard();
+    xr.setPieces(null);
+    this._enterPlacing();
 
-    showToast('Aim controller at board corners and pull trigger to mark TL and BR');
-
-    // Start camera
-    try {
-      await this._camera.start();
-    } catch (err) {
-      showToast('Camera not available. Using XR camera frames.', 3000, 'warn');
-    }
-
-    this._setupControllers();
-    this._camera.onFrame((canvas) => this._onCameraFrame(canvas));
+    xr.on('selectstart', (i) => this._onTrigger(i));
+    xr.on('selectend', (i) => this._onTriggerEnd(i));
+    xr.on('squeeze', () => this._onGrip());
+    xr.on('button', (name) => this._onButton(name));
+    xr.onFrame((_t, _f, n) => this._onFrame(n));
     return this;
   }
 
   stop() {
-    this._active = false;
-    this._camera.stop();
-    this._state = 'idle';
+    for (const e of ['selectstart', 'selectend', 'squeeze', 'button']) this._xr.on(e, null);
+    this._xr.showPreview(null);
+  }
+
+  _enterPlacing() {
+    this._state = 'placing';
+    this._drag = null;
+    this._pending = null;
+    this._detector.clearCalibration();
+    this._xr.hideBoard();
+    this._xr.clearArrows();
+    this._xr.placeHudInFront();
+    this._xr.setHud({
+      title: 'Physical board — mark the board',
+      controls: this._camera ? '' : 'Camera off: overlay + arrows only, enter moves with the trigger.',
+    });
+    showToast(PLACE_HELP);
+  }
+
+  // ─── Input ────────────────────────────────────────────────────────────────
+
+  _onTrigger(i) {
+    const xr = this._xr;
+    if (this._state === 'placing') {
+      this._drag = { start: xr.controllerTip(i), idx: i };
+      showToast('Now drag to the opposite corner and release');
+      return;
+    }
+    xr.setHoverOwner(i);
+    this._picker.selectSquare(xr.squareAtController(i));
+  }
+
+  _onTriggerEnd(i) {
+    if (this._state !== 'placing' || !this._drag || this._drag.idx !== i) return;
+    const spec = this._xr.boardFromDiagonal(this._drag.start, this._xr.controllerTip(i));
+    this._drag = null;
+    this._xr.showPreview(null);
+    if (!spec) { showToast('Too small — drag corner to opposite corner of the board'); return; }
+    this._xr.lockBoard(spec);
+    this._xr.setHud({ title: 'Physical board', controls: SCAN_CONTROLS });
+    this._picker.reset();
+    this._onMoveConfirmed(null);
+    if (this._camera?.ready) {
+      this._beginCalibration();
+    } else {
+      this._state = 'manual';
+      showToast(`Board locked (${Math.round(spec.size * 100)} cm). No camera — enter moves with the trigger.`);
+    }
+  }
+
+  _onGrip() {
+    if (this._state === 'placing') return;
+    if (this._pending?.suggestion) { this._play(this._pending.suggestion, 'accepted'); return; }
+    if (this._picker.cancel()) return;
+    if (this._camera?.ready) { this._beginCalibration(); showToast('Rescanning board…'); }
+  }
+
+  _onButton(name) {
+    if (this._state === 'placing') return;
+    if (name === 'primary') this.undo();
+    else if (name === 'secondary') this._enterPlacing();
+    else if (name === 'stick') this.flip();
+    else if (name === 'left' || name === 'right') {
+      if (this._picker.cyclePromotion(name === 'left' ? -1 : 1)) return;
+      this._xr.rotateBoard(name === 'left' ? 1 : -1);
+      this._resync('Overlay rotated');
+    }
   }
 
   flip() {
-    this._whiteAtBottom = !this._whiteAtBottom;
-    showToast(`Board flipped — ${this._whiteAtBottom ? 'White' : 'Black'} at bottom`);
+    this._xr.whiteAtBottom = !this._xr.whiteAtBottom;
+    this._resync(`${this._xr.whiteAtBottom ? 'White' : 'Black'} side now nearest you`);
   }
 
-  requestRescan() {
-    this._gripRequestedRescan = true;
-    showToast('Rescan requested — prioritising changed squares');
+  undo() {
+    const move = this._game.undo();
+    if (!move) { showToast('Nothing to undo'); return; }
+    this._pending = null;
+    this._picker.reset();
+    this._pausedUntil = performance.now() + 4000;
+    this._onMoveConfirmed(null);
+    showToast(`Undone ${move.san} — put the pieces back (detection paused 4 s)`);
   }
 
-  _setupControllers() {
-    this._xr.onSelectStart((ctrlIdx, _e) => {
-      if (this._state !== 'placing') {
-        // In scanning mode, trigger starts manual correction
-        return;
-      }
-      if (!this._cornerDragStart) {
-        this._cornerDragStart = this._xr.getControllerPosition(ctrlIdx);
-        this._cornerDragController = ctrlIdx;
-        showToast('Corner 1 set — now aim at opposite corner and pull trigger again');
-      } else if (this._cornerDragController === ctrlIdx) {
-        const end = this._xr.getControllerPosition(ctrlIdx);
-        this._lockBoard(this._cornerDragStart, end);
-        this._cornerDragStart = null;
-      }
-    });
-
-    this._xr.onSqueezeStart((ctrlIdx, _e) => {
-      if (this._state === 'scanning') {
-        this.requestRescan();
-      } else if (this._state === 'ambiguous') {
-        // Side grip selects first candidate
-        this._resolveAmbiguity(this._pendingCandidates[0]);
-      }
-    });
+  loadPosition(fen) {
+    if (!this._game.loadFen(fen)) { showToast('Invalid FEN'); return false; }
+    this._resync('Position loaded');
+    this._onMoveConfirmed(null);
+    return true;
   }
 
-  _lockBoard(tlWorld, brWorld) {
-    // Convert 3D world positions to 2D screen-space for the detector
-    // Using a simplified projection: project to camera canvas coordinates
-    const cameraCanvas = this._camera.getCanvas();
-    const W = cameraCanvas.width;
-    const H = cameraCanvas.height;
-
-    // Fallback: use center fraction of image as board
-    const margin = 0.15;
-    const tl2d = { x: W * margin, y: H * margin };
-    const br2d = { x: W * (1 - margin), y: H * (1 - margin) };
-    this._detector.setCorners(tl2d, br2d);
-
-    this._state = 'scanning';
-    this._lastOccupancy = null;
-    showToast('Board locked. Scanning for moves…');
-
-    // Place the 3D board overlay at a reasonable AR position
-    // Position it 0.6m in front of the camera, slightly below
-    const camera = this._xr.camera;
-    const boardPos = new (camera.position.constructor)();
-    boardPos.copy(camera.position);
-    boardPos.z -= 0.6;
-    boardPos.y -= 0.1;
-    this._xr.placeBoard(boardPos, { x: -Math.PI / 12, y: 0, z: 0 }, 0.35);
+  _resync(msg) {
+    this._pending = null;
+    this._picker.reset();
+    this._xr.clearArrow('suggest');
+    this._onMoveConfirmed(null);
+    if (this._camera?.ready && this._state !== 'placing') this._beginCalibration();
+    showToast(msg);
   }
 
-  // Auto-detect board in camera frame and lock
-  async _autoDetectBoard(canvas) {
-    const corners = this._detector.detectBoardCorners(canvas);
-    if (corners) {
-      this._detector.setFourCorners(corners);
+  // ─── Vision loop ──────────────────────────────────────────────────────────
+
+  _beginCalibration() {
+    this._state = 'calibrating';
+    this._detector.clearCalibration();
+    this._prevOcc = null;
+    this._stable = 0;
+  }
+
+  _onFrame(n) {
+    const xr = this._xr;
+    if (this._state === 'placing') {
+      if (this._drag) xr.showPreview(xr.boardFromDiagonal(this._drag.start, xr.controllerTip(this._drag.idx)));
+      return;
+    }
+    if (n % FRAME_EVERY !== 0 || !this._camera?.ready) return;
+    if (this._state !== 'calibrating' && this._state !== 'scanning') return;
+
+    const canvas = this._camera.grab();
+    if (!canvas) return;
+    this._detector.setFourCorners(xr.projectBoardToImage(canvas.width, canvas.height));
+    const v = xr.viewerDirOnBoard();
+    this._detector.setViewDir(v.x, v.y);
+    const obs = this._detector.analyzeFrame(canvas);
+    if (!obs) return;
+    const toIdx = (sq) => xr.squareToIndex(sq);
+
+    if (this._state === 'calibrating') {
+      const expected = expectedFromBoard(this._game.boardArray(), toIdx);
+      const ok = this._detector.calibrate(obs, expected);
+      const check = ok ? matchMove(this._detector.analyzeFrame(canvas), this._game.chess, toIdx).base : 99;
       this._state = 'scanning';
-      this._lastOccupancy = null;
-      showToast('Board auto-detected and locked. Scanning…');
-      return true;
-    }
-    return false;
-  }
-
-  _onCameraFrame(canvas) {
-    if (!this._active || this._state === 'idle' || this._state === 'placing') return;
-    this._frameCount++;
-    if (this._frameCount % this._frameInterval !== 0) return;
-
-    if (this._gripRequestedRescan) {
-      this._gripRequestedRescan = false;
-      const result = this._detector.rescanChangedSquares(canvas, this._lastOccupancy);
-      if (result) {
-        this._lastOccupancy = result.occupancy;
-        this._updateBoardOverlay(result.occupancy, result.colors);
-      }
+      this._warnedUnreadable = false;
+      showToast(ok && check <= 6
+        ? 'Board locked and calibrated — make your move'
+        : 'Board locked, but the camera view does not line up well. Moves may need the trigger. B/Y re-marks.');
       return;
     }
 
-    if (this._state === 'scanning') {
-      this._processFrame(canvas);
-    }
-  }
+    const occKey = obs.occupancy.map(Number).join('');
+    this._stable = occKey === this._prevOcc ? this._stable + 1 : 0;
+    this._prevOcc = occKey;
+    if (this._stable < STABLE_FRAMES || this._picker.busy || performance.now() < this._pausedUntil) return;
 
-  _processFrame(canvas) {
-    const result = this._detector.processFrame(
-      canvas,
-      this._lastOccupancy,
-      this._game,
-      this._whiteAtBottom
-    );
-    if (!result) return;
-
-    const { candidates, occupancy, colors } = result;
-    this._lastOccupancy = occupancy;
-    this._updateBoardOverlay(occupancy, colors);
-
-    if (!candidates.length) {
-      this._occlusionCounter++;
-      if (this._occlusionCounter > this._maxOcclusion) {
-        // Board temporarily occluded — keep last known position, do nothing
-      }
-      return;
-    }
-
-    this._occlusionCounter = 0;
-
-    if (candidates.length === 1) {
-      // Unambiguous legal move — confirm after a short settling delay
-      clearTimeout(this._scanTimeout);
-      this._scanTimeout = setTimeout(() => {
-        this._confirmMove(candidates[0]);
-      }, 400);
-    } else if (candidates.length > 1) {
-      this._handleAmbiguity(candidates);
-    }
-  }
-
-  _updateBoardOverlay(occupancy, colors) {
-    this._xr.clearHighlights();
-    for (let i = 0; i < 64; i++) {
-      if (occupancy[i]) {
-        const c = colors[i] === 'w' ? 0xf5f0e0 : 0x2a2a2a;
-        this._xr.highlightSquare(i, c, 0.4);
-      }
+    const decision = decideMove(matchMove(obs, this._game.chess, toIdx));
+    if (decision.kind === 'move') {
+      this._play(decision.move, 'detected');
+    } else if (decision.kind === 'ambiguous') {
+      this._handleAmbiguity(decision.candidates);
+    } else if (decision.kind === 'unreadable' && !this._warnedUnreadable && this._stable > STABLE_FRAMES * 3) {
+      this._warnedUnreadable = true;
+      showToast("Can't read that move — point and pull the trigger to enter it, or grip to rescan");
+    } else if (decision.kind === 'none') {
+      this._warnedUnreadable = false;
     }
   }
 
   async _handleAmbiguity(candidates) {
-    this._state = 'ambiguous';
-    this._pendingCandidates = candidates;
+    const key = candidates.map(m => m.from + m.to).join(',');
+    if (this._pending?.key === key) return;
+    this._pending = { key, candidates, suggestion: null };
+    this._picker.redraw();
+    showToast(`Unclear: ${candidates.map(m => m.san).join(' or ')} — asking for a suggestion…`);
 
-    // Show candidates as highlights
-    this._xr.clearHighlights();
-    for (const c of candidates) {
-      this._xr.highlightSquare(c.from, 0xffaa00, 0.7);
-      this._xr.highlightSquare(c.to, 0xffd700, 0.7);
-    }
-
-    showToast(`Ambiguous: ${candidates.map(c => `${c.from}→${c.to}`).join(' or ')}. Asking Groq…`, 4000);
-
-    // Ask Groq to rank them
     const ranked = await rankCandidateMoves(
-      this._game.confirmedFen(),
-      candidates.map(c => ({ ...c, evidence: `color-match` }))
+      this._game.fen(),
+      candidates.map(m => ({ from: m.from, to: m.to, evidence: m.san }))
     );
-
-    if (ranked) {
-      showToast(`Groq suggests ${ranked.from}→${ranked.to}. Pull trigger to confirm or grip to cycle.`);
-      this._pendingCandidates = [ranked, ...candidates.filter(c => c !== ranked)];
+    if (this._pending?.key !== key) return;
+    const pick = ranked && candidates.find(m => m.from === ranked.from && m.to === ranked.to);
+    if (pick) {
+      this._pending.suggestion = pick;
+      this._xr.showArrow(pick.from, pick.to, 0xc77dff, 'suggest');
+      showToast(`Looks like ${pick.san}. Grip to accept, or trigger the real move.`);
     } else {
-      showToast(`Select move: ${candidates.map((c, i) => `[${i + 1}] ${c.from}→${c.to}`).join(' | ')}`);
+      showToast(`Which was it: ${candidates.map(m => m.san).join(' / ')}? Enter it with the trigger.`);
     }
   }
 
-  _resolveAmbiguity(candidate) {
-    if (!candidate) return;
-    this._state = 'scanning';
-    this._confirmMove(candidate);
+  _drawCandidates() {
+    if (!this._pending) return;
+    for (const m of this._pending.candidates) {
+      this._xr.highlightSquare(m.from, 0xffaa00, 0.55);
+      this._xr.highlightSquare(m.to, 0xffd700, 0.55);
+    }
   }
 
-  _confirmMove({ from, to }) {
-    const promotion = this._needsPromotion(from, to) ? 'q' : undefined;
-    const move = this._game.applyMove(from, to, promotion);
-    if (!move) {
-      showToast(`Move ${from}→${to} rejected by rules`, 2000, 'warn');
-      this._state = 'scanning';
-      return;
-    }
-    this._detector.saveConfirmedOccupancy();
+  _play(move, how) {
+    const played = this._game.applyMove(move.from, move.to, move.promotion || 'q');
+    if (!played) { showToast(`${move.san ?? move.from + move.to} is not legal here`); return; }
+    this._afterMove(played, how);
+  }
+
+  _afterMove(move, how) {
+    this._pending = null;
+    this._xr.clearArrow('suggest');
+    this._picker.lastMove = { from: move.from, to: move.to };
+    this._picker.redraw();
+    this._stable = 0;
+    this._warnedUnreadable = false;
+    showToast(`${how === 'detected' ? 'Detected' : 'Played'} ${move.san}`);
     this._onMoveConfirmed(move);
-    this._xr.clearHighlights();
-    this._state = 'scanning';
-  }
-
-  _needsPromotion(from, to) {
-    const piece = this._game.pieceAt(from);
-    if (!piece || piece.type !== 'p') return false;
-    return (piece.color === 'w' && to[1] === '8') || (piece.color === 'b' && to[1] === '1');
   }
 }

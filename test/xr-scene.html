@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>XR scene test</title>
+  <style>html,body{margin:0;background:#556070;overflow:hidden}</style>
+  <script type="importmap">
+  { "imports": {
+      "three": "../js/vendor/three/build/three.module.min.js",
+      "three/addons/": "../js/vendor/three/examples/jsm/" } }
+  </script>
+  <script src="../js/lib/chess.js"></script>
+</head>
+<body>
+<script type="module">
+// Renders the AR scene without a headset (regular camera) so it can be
+// screenshotted, and runs the vision pipeline on rendered "camera" frames.
+import * as THREE from 'three';
+import { XRSession } from '../js/xr.js';
+import { BoardDetector, matchMove, decideMove, expectedFromBoard } from '../js/vision.js';
+
+const xr = await new XRSession().init();
+xr.renderer.domElement.style.display = 'block';
+const cam = xr.camera;
+
+function look(from, to) {
+  cam.position.copy(from);
+  cam.lookAt(to);
+  cam.updateMatrixWorld();
+}
+
+window.sceneManual = () => {
+  look(new THREE.Vector3(0, 1.6, 0), new THREE.Vector3(0, 1.1, -0.5));
+  xr.whiteAtBottom = true;
+  xr.setStyle('virtual');
+  xr.placeInFront();
+  const g = new Chess();
+  for (const m of ['e4', 'e5', 'Nf3', 'Nc6']) g.move(m);
+  xr.setPieces(g.board());
+  xr.highlightSquare('c6', 0xffe14a, 0.5);
+  xr.highlightSquare('b8', 0xffe14a, 0.35);
+  xr.showArrow('f1', 'b5');
+  xr.setHud({ title: 'Manual board', status: 'Played Nc6', hint: 'Best move: f1 → b5   +0.4',
+    controls: 'Trigger: piece → square · Grip: cancel · A/X: undo · B/Y: re-centre board' });
+  look(new THREE.Vector3(0, 1.6, 0), new THREE.Vector3(0, 1.05, -0.55));
+  xr.renderer.render(xr.scene, cam);
+};
+
+window.scenePhysical = () => {
+  look(new THREE.Vector3(0, 1.3, 0.1), new THREE.Vector3(0, 0.75, -0.35));
+  xr.setStyle('overlay');
+  const spec = xr.boardFromDiagonal(new THREE.Vector3(-0.2, 0.75, -0.55), new THREE.Vector3(0.2, 0.75, -0.15));
+  xr.lockBoard(spec);
+  xr.clearHighlights();
+  xr.highlightSquare('e2', 0xffe14a, 0.35);
+  xr.highlightSquare('e4', 0xffe14a, 0.5);
+  xr.showArrow('g8', 'f6');
+  xr.setHud({ title: 'Physical board', status: 'Detected e4', hint: 'Opponent to move', controls: '' });
+  xr.renderer.render(xr.scene, cam);
+  return { size: spec.size, yaw: spec.yaw };
+};
+
+// Vision end-to-end: render the virtual board from a seated player's viewpoint,
+// treat the render as the passthrough camera frame, detect each move.
+window.visionGame = (sans, viewY = 1.25, viewZ = 0.05) => {
+  xr._hudMesh.visible = false;
+  xr.clearHighlights();
+  xr.clearArrows();
+  xr.setStyle('virtual');
+  xr.whiteAtBottom = true;
+  xr.lockBoard({ center: new THREE.Vector3(0, 0.75, -0.35), yaw: 0, size: 0.4 });
+  look(new THREE.Vector3(0, viewY, viewZ), new THREE.Vector3(0, 0.75, -0.35));
+
+  const frame = document.createElement('canvas');
+  frame.width = 640; frame.height = 360;
+  const fctx = frame.getContext('2d', { willReadFrequently: true });
+  const grab = (board) => {
+    xr.setPieces(board);
+    xr.renderer.render(xr.scene, cam);
+    fctx.drawImage(xr.renderer.domElement, 0, 0, frame.width, frame.height);
+    return frame;
+  };
+  const toIdx = (sq) => xr.squareToIndex(sq);
+  const det = new BoardDetector();
+  const truth = new Chess(), game = new Chess();
+
+  let canvas = grab(truth.board());
+  det.setFourCorners(xr.projectBoardToImage(frame.width, frame.height));
+  const v = xr.viewerDirOnBoard();
+  det.setViewDir(v.x, v.y);
+  const calibrated = det.calibrate(det.analyzeFrame(canvas), expectedFromBoard(truth.board(), toIdx));
+  const startBase = matchMove(det.analyzeFrame(canvas), game, toIdx).base;
+
+  const rows = [];
+  let t = 0;
+  const misread = (obs, chess) => {
+    const exp = expectedFromBoard(chess.board(), toIdx);
+    const bad = [];
+    for (let i = 0; i < 64; i++) {
+      if (obs.occupancy[i] !== !!exp[i]) bad.push(xr.indexToSquare(i) + (exp[i] ? '(missed ' + exp[i] + ' σ' + obs.sigma[i].toFixed(0) + ' μ' + obs.mu[i].toFixed(0) + ')' : '(ghost σ' + obs.sigma[i].toFixed(0) + ' μ' + obs.mu[i].toFixed(0) + ')'));
+      else if (exp[i] && obs.colors[i] !== exp[i]) bad.push(xr.indexToSquare(i) + '(colour ' + exp[i] + '→' + obs.colors[i] + ' μ' + obs.mu[i].toFixed(0) + ')');
+    }
+    return bad;
+  };
+  window.__debug = { calib: det._calib, start: misread(det.analyzeFrame(canvas), truth) };
+  for (const san of sans) {
+    truth.move(san);
+    canvas = grab(truth.board());
+    const t0 = performance.now();
+    const obs = det.analyzeFrame(canvas);
+    const d = decideMove(matchMove(obs, game, toIdx));
+    t += performance.now() - t0;
+    let outcome;
+    if (d.kind === 'move' && d.move.san === san) outcome = 'auto';
+    else if (d.kind === 'ambiguous' && d.candidates.some(m => m.san === san)) outcome = 'confirm';
+    else if (d.kind === 'move') outcome = 'WRONG:' + d.move.san;
+    else outcome = 'missed:' + d.kind;
+    rows.push({ san, outcome, bad: outcome === 'auto' ? undefined : misread(obs, truth) });
+    game.move(san); // keep in sync (as the player would via confirm/trigger)
+  }
+  return { calibrated, startBase, rows, msPerFrame: t / sans.length, debug: window.__debug };
+};
+
+window.ready = true;
+</script>
+</body>
+</html>

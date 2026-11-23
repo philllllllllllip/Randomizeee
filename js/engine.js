@@ -1,58 +1,50 @@
-// Stockfish WASM wrapper — loads the engine in a Web Worker via Blob URL
+// Stockfish 11 in a Web Worker, served from this site (no CDN).
+// WASM build first; pure-JS asm.js build as a fallback.
 // Provides async getBestMove(fen, depth, movetime) → {move, score}
 
-// Pure-JS Stockfish 11 — no WASM, works as a Blob Worker in all browsers
-const STOCKFISH_CDN = 'https://cdn.jsdelivr.net/npm/stockfish@11.0.0/stockfish.js';
-const STOCKFISH_FALLBACK = 'https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js';
+const BUILDS = ['js/vendor/stockfish/stockfish.js', 'js/vendor/stockfish/stockfish.asm.js'];
 
 export class StockfishEngine {
   constructor() {
     this._worker = null;
     this._ready = false;
-    this._resolveMap = new Map(); // id → {resolve, reject, buffer}
-    this._currentId = 0;
-    this._pendingLines = [];
     this._bestMoveResolve = null;
     this._bestMoveBuffer = [];
-    this._onReady = null;
   }
 
   async load(onProgress) {
-    onProgress?.('Fetching Stockfish…');
-    let scriptText;
-    try {
-      const r = await fetch(STOCKFISH_CDN);
-      if (!r.ok) throw new Error('CDN fetch failed');
-      scriptText = await r.text();
-    } catch {
-      onProgress?.('Falling back to Stockfish 11…');
-      const r2 = await fetch(STOCKFISH_FALLBACK);
-      scriptText = await r2.text();
+    let lastErr;
+    for (const url of BUILDS) {
+      try {
+        onProgress?.('Loading Stockfish…');
+        await this._start(url);
+        onProgress?.('Stockfish ready');
+        return this;
+      } catch (err) {
+        lastErr = err;
+        console.warn(`Stockfish build ${url} failed:`, err?.message ?? err);
+        this._worker?.terminate();
+        this._worker = null;
+      }
     }
+    throw lastErr ?? new Error('Stockfish failed to load');
+  }
 
-    // Create blob URL so we can use the script as a Worker
-    const blob = new Blob([scriptText], { type: 'application/javascript' });
-    const blobUrl = URL.createObjectURL(blob);
-    this._worker = new Worker(blobUrl);
-    URL.revokeObjectURL(blobUrl);
-
+  _start(url) {
     return new Promise((resolve, reject) => {
+      const worker = new Worker(url);
+      this._worker = worker;
       const timeout = setTimeout(() => reject(new Error('Stockfish init timeout')), 20000);
-      this._worker.onmessage = (e) => {
-        const line = typeof e.data === 'string' ? e.data : (e.data?.text ?? String(e.data ?? ''));
-        // Stockfish 11 returns 'uciok' after the 'uci' command
-        if (line.includes('uciok') || line.startsWith('Stockfish') || line.startsWith('id name')) {
-          if (line.includes('uciok')) {
-            clearTimeout(timeout);
-            this._ready = true;
-            this._worker.onmessage = (ev) => this._handleMessage(ev);
-            onProgress?.('Stockfish ready');
-            resolve(this);
-          }
-        }
+      worker.onmessage = (e) => {
+        const line = typeof e.data === 'string' ? e.data : String(e.data ?? '');
+        if (!line.includes('uciok')) return;
+        clearTimeout(timeout);
+        this._ready = true;
+        worker.onmessage = (ev) => this._handleMessage(ev);
+        resolve();
       };
-      this._worker.onerror = (err) => { clearTimeout(timeout); reject(err); };
-      this._worker.postMessage('uci');
+      worker.onerror = (err) => { clearTimeout(timeout); reject(new Error(err.message || 'worker error')); };
+      worker.postMessage('uci');
     });
   }
 
@@ -105,11 +97,11 @@ export class StockfishEngine {
   }
 
   stop() {
-    this._send('stop');
+    if (this._worker) this._send('stop');
   }
 
   newGame() {
-    this._send('ucinewgame');
+    if (this._worker) this._send('ucinewgame');
   }
 
   destroy() {

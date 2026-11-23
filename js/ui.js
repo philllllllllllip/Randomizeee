@@ -166,8 +166,12 @@ export class DesktopBoard {
   }
 }
 
-// Simple toast notification
+let toastSink = null;
+// While in AR, messages are routed to the in-headset HUD (DOM is invisible there).
+export function setToastSink(fn) { toastSink = fn; }
+
 export function showToast(message, duration = 2500, type = 'info') {
+  toastSink?.(message, type);
   let el = document.getElementById('xr-toast');
   if (!el) {
     el = document.createElement('div');

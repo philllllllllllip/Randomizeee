@@ -6,7 +6,15 @@ import { ChessGame } from './game.js';
 import { StockfishEngine } from './engine.js';
 import { PhysicalBoardMode } from './modes/physical.js';
 import { ManualBoardMode } from './modes/manual.js';
-import { DesktopBoard, showToast } from './ui.js';
+import { DesktopBoard, showToast, setToastSink } from './ui.js';
+import { CameraManager } from './vision.js';
+
+// Preloaded in the background after boot; awaited when entering AR.
+let xrModulePromise = null;
+function loadXRModule() {
+  xrModulePromise ??= import('./xr.js');
+  return xrModulePromise;
+}
 
 // ─── Progress helpers ─────────────────────────────────────────────────────────
 function setProgress(pct, msg) {
@@ -29,6 +37,8 @@ const state = {
   game: new ChessGame(),
   engine: new StockfishEngine(),
   xr: null,          // created lazily on "Start AR"
+  camera: null,
+  engineRerun: false,
   mode: null,
   modeInstance: null,
   playerColor: 'w',
@@ -51,10 +61,9 @@ async function boot() {
 
   // Stockfish loads in the background — non-blocking, non-fatal
   setProgress(70, 'Loading Stockfish (background)…');
-  state.engine.load((msg) => {
-    // Keep status updated but don't block UI
-    const status = document.getElementById('loader-status');
-    if (status && document.getElementById('loading-screen')) status.textContent = msg;
+  state.engine.load().then(() => {
+    // If a game is already running, show the first hint now that the engine is up.
+    if (state.mode) onMoveConfirmed(null);
   }).catch((err) => {
     console.warn('Stockfish unavailable:', err.message);
   });
@@ -63,6 +72,8 @@ async function boot() {
   const xrSupported = await navigator.xr?.isSessionSupported('immersive-ar').catch(() => false);
   if (!xrSupported) {
     document.getElementById('browser-warning')?.classList.remove('hidden');
+  } else {
+    loadXRModule().catch(() => { xrModulePromise = null; });
   }
 
   setProgress(100, 'Ready');
@@ -98,63 +109,108 @@ async function startMode(mode) {
   await startXRMode(mode);
 }
 
-// Three.js and XRSession are loaded here — only when the user actually
-// enters AR, so the landing page never waits for CDN traffic.
+function overlay(text) {
+  const el = document.createElement('div');
+  el.style.cssText =
+    'position:fixed;inset:0;background:#05060cf0;color:#fff;display:flex;flex-direction:column;' +
+    'gap:24px;align-items:center;justify-content:center;font:600 20px system-ui,sans-serif;' +
+    'z-index:800;text-align:center;padding:24px;';
+  el.textContent = text;
+  document.body.appendChild(el);
+  return el;
+}
+
 async function startXRMode(modeName) {
-  // Show a small loading overlay while Three.js downloads
-  const overlay = document.createElement('div');
-  overlay.style.cssText =
-    'position:fixed;inset:0;background:#000a;color:#fff;display:flex;' +
-    'align-items:center;justify-content:center;font-size:20px;z-index:800;';
-  overlay.textContent = 'Loading AR… (first time ~2 s)';
-  document.body.appendChild(overlay);
-
+  const ov = overlay(modeName === 'physical' ? 'Requesting camera…' : 'Loading AR…');
   try {
-    const { XRSession } = await import('./xr.js');
-    const xr = new XRSession();
-    await xr.init();
-    state.xr = xr;
-    xr.startRenderLoop();
+    if (modeName === 'physical') {
+      state.camera ??= new CameraManager();
+      try {
+        await state.camera.start();
+      } catch (err) {
+        console.warn('Camera unavailable:', err);
+        state.camera = null;
+        showToast('No camera access — overlay + arrows only, enter moves with the trigger', 5000, 'warn');
+      }
+    }
+    ov.textContent = 'Loading AR…';
+    if (!state.xr) {
+      const { XRSession } = await loadXRModule();
+      state.xr = await new XRSession().init();
+      state.xr.startRenderLoop();
+      state.xr.on('sessionstart', () => launchMode(state.mode));
+      state.xr.on('sessionend', onSessionEnd);
+      setToastSink((msg) => state.xr.setHud({ status: msg }));
+    }
 
-    overlay.remove();
-
-    const arButton = xr.createARButton();
-    arButton.style.cssText =
-      'position:fixed;bottom:40px;left:50%;transform:translateX(-50%);' +
-      'padding:14px 32px;background:#4a9eff;color:#fff;border:none;' +
-      'border-radius:8px;font-size:16px;font-weight:700;cursor:pointer;z-index:600;';
-    document.body.appendChild(arButton);
-
-    xr.renderer.xr.addEventListener('sessionstart', () => {
-      arButton.remove();
-      xr.showCanvas();
-      launchMode(modeName);
-    });
+    // requestSession needs a fresh user gesture, so ask for one more tap.
+    ov.textContent = '';
+    const btn = document.createElement('button');
+    btn.textContent = 'ENTER AR';
+    btn.style.cssText =
+      'padding:22px 56px;background:#4a9eff;color:#fff;border:none;border-radius:14px;' +
+      'font:800 26px system-ui,sans-serif;cursor:pointer;';
+    const back = document.createElement('button');
+    back.textContent = 'Back';
+    back.style.cssText = 'background:none;border:1px solid #445;color:#aab;padding:10px 28px;border-radius:10px;font-size:16px;';
+    ov.append(btn, back);
+    back.onclick = () => { ov.remove(); showLanding(); };
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = 'Starting…';
+      try {
+        await state.xr.enterAR();
+        ov.remove();
+      } catch (err) {
+        console.error('requestSession failed:', err);
+        btn.disabled = false;
+        btn.textContent = 'ENTER AR';
+        showToast('Could not start AR: ' + err.message, 5000, 'error');
+      }
+    };
   } catch (err) {
-    overlay.remove();
+    ov.remove();
     console.error('XR init failed:', err);
-    showToast('AR unavailable — using desktop board');
+    showToast('AR unavailable — using desktop board', 4000, 'warn');
     startDesktopFallback();
   }
 }
 
-function launchMode(modeName) {
+async function launchMode(modeName) {
   const { game, engine, xr } = state;
+  state.modeInstance?.stop?.();
+  xr.clearFrameCallbacks();
+  xr.clearArrows();
+  xr.clearHighlights();
   game.reset();
   engine.newGame?.();
-  xr.clearHighlights?.();
-  xr.clearArrow?.();
-  state.modeInstance?.stop?.();
+  xr.setHud({ status: 'Starting…', hint: '', controls: '' });
+
+  // The viewer pose is only real after a few XR frames.
+  await xr.waitForPose(5);
 
   if (modeName === 'physical') {
-    state.modeInstance = new PhysicalBoardMode(game, engine, xr, onMoveConfirmed);
-    state.modeInstance.start({ playerColor: state.playerColor });
+    state.modeInstance = new PhysicalBoardMode(game, engine, xr, onMoveConfirmed, state.camera);
   } else {
     state.modeInstance = new ManualBoardMode(game, engine, xr, onMoveConfirmed);
-    state.modeInstance.start({ playerColor: state.playerColor });
   }
+  state.modeInstance.start({ playerColor: state.playerColor });
+  onMoveConfirmed(null);
+}
 
-  xr.onFrame((_time, _frame) => { /* XR HUD updates if needed */ });
+function onSessionEnd() {
+  state.modeInstance?.stop?.();
+  state.modeInstance = null;
+  state.xr?.clearFrameCallbacks();
+  state.camera?.stop();
+  state.camera = null;
+  showLanding();
+}
+
+function showLanding() {
+  state.mode = null;
+  document.getElementById('desktop-hud')?.classList.add('hidden');
+  document.getElementById('landing')?.classList.remove('hidden');
 }
 
 // ─── Move Confirmed Callback ──────────────────────────────────────────────────
@@ -167,30 +223,41 @@ async function onMoveConfirmed(_move) {
   }
 
   const isPlayerTurn = state.game.turn() === state.playerColor;
-  if (isPlayerTurn && !state.engineBusy) {
+  state.xr?.clearArrow('best');
+  state.desktopBoard?.clearArrow();
+  const el = document.getElementById('desktop-move-hint');
+  if (el) el.textContent = '';
+  if (isPlayerTurn) {
+    state.xr?.setHud({ hint: state.engine._ready ? 'Thinking…' : 'Engine loading…' });
     requestEngineHint();
   } else {
-    state.xr?.clearArrow?.();
-    const el = document.getElementById('desktop-move-hint');
-    if (el) el.textContent = '';
+    state.xr?.setHud({ hint: 'Opponent to move' });
   }
 }
 
 async function requestEngineHint() {
-  if (!state.engine._ready || state.engineBusy) return;
+  if (!state.engine._ready) return;
+  if (state.engineBusy) { state.engineRerun = true; return; }
   state.engineBusy = true;
   try {
     const fen = state.game.fen();
     const { move, score } = await state.engine.getBestMove(fen, state.engineDepth, 2000);
-    if (!move || move === '(none)') return;
+    // Ignore stale results if the position changed while thinking.
+    if (fen !== state.game.fen() || !move || move === '(none)') return;
     const from = move.slice(0, 2);
     const to = move.slice(2, 4);
-    state.xr?.showArrow?.(from, to);
+    state.xr?.showArrow(from, to);
+    state.desktopBoard?.setArrow(from, to);
+    updateDesktopBoard();
     updateMoveHintUI(move, score);
   } catch (err) {
     console.warn('Engine error:', err);
   } finally {
     state.engineBusy = false;
+    if (state.engineRerun) {
+      state.engineRerun = false;
+      if (state.game.turn() === state.playerColor) requestEngineHint();
+    }
   }
 }
 
@@ -201,6 +268,8 @@ function updateMoveHintUI(uciMove, score) {
     : '';
   const el = document.getElementById('desktop-move-hint');
   if (el) el.textContent = `Best: ${from}→${to}  ${scoreStr}`;
+  // Engine score is from the side to move's perspective.
+  state.xr?.setHud({ hint: `Best move: ${from} → ${to}   ${scoreStr}` });
 }
 
 function getGameOverReason() {

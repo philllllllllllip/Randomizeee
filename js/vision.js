@@ -68,24 +68,20 @@ function warpPerspective(srcCanvas, corners, S) {
   if (!H) return null;
 
   const out = new Uint8ClampedArray(S * S * 4);
-
+  const src = srcData.data;
   for (let dy = 0; dy < S; dy++) {
     for (let dx = 0; dx < S; dx++) {
       const { x: sx, y: sy } = applyH(H, dx + 0.5, dy + 0.5);
-      // Bilinear sample
       const x0 = Math.floor(sx), y0 = Math.floor(sy);
-      const x1 = x0 + 1, y1 = y0 + 1;
+      if (x0 < 0 || y0 < 0 || x0 + 1 >= srcW || y0 + 1 >= srcH) continue;
       const fx = sx - x0, fy = sy - y0;
-      const getP = (px, py) => {
-        if (px < 0 || py < 0 || px >= srcW || py >= srcH) return [0,0,0,0];
-        const i = (py * srcW + px) * 4;
-        return [srcData.data[i], srcData.data[i+1], srcData.data[i+2], srcData.data[i+3]];
-      };
-      const p00 = getP(x0,y0), p10 = getP(x1,y0), p01 = getP(x0,y1), p11 = getP(x1,y1);
+      const i00 = (y0 * srcW + x0) * 4, i10 = i00 + 4, i01 = i00 + srcW * 4, i11 = i01 + 4;
+      const w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;
       const oi = (dy * S + dx) * 4;
-      for (let c = 0; c < 4; c++) {
-        out[oi+c] = p00[c]*(1-fx)*(1-fy) + p10[c]*fx*(1-fy) + p01[c]*(1-fx)*fy + p11[c]*fx*fy;
+      for (let c = 0; c < 3; c++) {
+        out[oi + c] = src[i00 + c] * w00 + src[i10 + c] * w10 + src[i01 + c] * w01 + src[i11 + c] * w11;
       }
+      out[oi + 3] = 255;
     }
   }
   return new ImageData(out, S, S);
@@ -96,7 +92,11 @@ function warpPerspective(srcCanvas, corners, S) {
 export class BoardDetector {
   constructor() {
     this._corners = null; // [{x,y}×4] TL,TR,BR,BL in src image pixels
-    this._boardSize = 480;
+    this._boardSize = 256;
+    this._calib = null; // learned per-board thresholds, see calibrate()
+    // Direction from board centre toward the viewer in warped-image axes
+    // (x = files left→right, y = rows far→near). Default: viewer at the near edge.
+    this._viewDir = { x: 0, y: 1 };
     this._lastOccupancy = null;
     this._lastColors = null;
     this._confirmedOccupancy = null;
@@ -112,6 +112,11 @@ export class BoardDetector {
   }
 
   setFourCorners(corners) { this._corners = corners; }
+
+  setViewDir(x, y) {
+    const n = Math.hypot(x, y) || 1;
+    this._viewDir = { x: x / n, y: y / n };
+  }
   hasCorners() { return this._corners !== null; }
   getCorners() { return this._corners; }
 
@@ -178,48 +183,86 @@ export class BoardDetector {
 
   _analyzeImageData(img, S) {
     const sqSize = S / 8;
-    const margin = Math.round(sqSize * 0.2);
-    const inner = Math.round(sqSize * 0.6);
+    // Tall pieces project into the square behind them, so sample a window
+    // shifted away from the viewer: it sees this square's piece body but not
+    // the top of the piece standing in front.
+    const inner = Math.round(sqSize * 0.5);
+    const shiftX = -this._viewDir.x * sqSize * 0.17;
+    const shiftY = -this._viewDir.y * sqSize * 0.17;
     const occupancy = new Array(64).fill(false);
     const colors = new Array(64).fill(null);
+    const mu = new Array(64), sigma = new Array(64);
 
     for (let row = 0; row < 8; row++) {
       for (let col = 0; col < 8; col++) {
         const idx = row * 8 + col;
-        const ox = Math.round(col * sqSize) + margin;
-        const oy = Math.round(row * sqSize) + margin;
-
+        const ox = Math.round((col + 0.5) * sqSize + shiftX - inner / 2);
+        const oy = Math.round((row + 0.5) * sqSize + shiftY - inner / 2);
         let sumL = 0, sumL2 = 0, n = 0;
         for (let dy = 0; dy < inner; dy++) {
           for (let dx = 0; dx < inner; dx++) {
             const px = ox + dx, py = oy + dy;
-            if (px >= S || py >= S) continue;
+            if (px < 0 || py < 0 || px >= S || py >= S) continue;
             const i = (py * S + px) * 4;
-            const r = img.data[i], g = img.data[i+1], b = img.data[i+2];
-            const L = (r*77 + g*150 + b*29) >> 8;
-            sumL += L; sumL2 += L*L; n++;
+            const L = (img.data[i] * 77 + img.data[i + 1] * 150 + img.data[i + 2] * 29) >> 8;
+            sumL += L; sumL2 += L * L; n++;
           }
         }
-        const mu = sumL / n;
-        const sigma = Math.sqrt(sumL2/n - mu*mu);
-        const isLightSq = (row + col) % 2 === 0;
+        const m = sumL / n;
+        const sd = Math.sqrt(Math.max(0, sumL2 / n - m * m));
+        mu[idx] = m; sigma[idx] = sd;
+        const light = (row + col) % 2 === 0 ? 'light' : 'dark';
+        const c = this._calib?.[light];
 
-        // Occupied if stddev exceeds threshold (piece adds texture)
-        const threshold = isLightSq ? 16 : 18;
-        const occ = sigma > threshold;
-        occupancy[idx] = occ;
-
-        if (occ) {
-          // Colour: white pieces are brighter than dark squares,
-          // black pieces are darker than light squares
-          const emptyRef = isLightSq ? 210 : 85;
-          const diff = mu - emptyRef;
-          colors[idx] = isLightSq ? (diff < -35 ? 'b' : 'w') : (diff > 35 ? 'w' : 'b');
+        if (c) {
+          // Calibrated: occupied if texture OR brightness departs from the empty square.
+          const occ = sd > c.sigmaThresh || Math.abs(m - c.emptyMu) > c.muThresh;
+          occupancy[idx] = occ;
+          if (occ) colors[idx] = Math.abs(m - c.whiteMu) <= Math.abs(m - c.blackMu) ? 'w' : 'b';
+        } else {
+          const occ = sd > (light === 'light' ? 16 : 18);
+          occupancy[idx] = occ;
+          if (occ) {
+            const diff = m - (light === 'light' ? 210 : 85);
+            colors[idx] = light === 'light' ? (diff < -35 ? 'b' : 'w') : (diff > 35 ? 'w' : 'b');
+          }
         }
       }
     }
-    return { occupancy, colors };
+    return { occupancy, colors, mu, sigma };
   }
+
+  // Learn thresholds from a frame whose true contents are known
+  // (expected[i] = 'w' | 'b' | null per display index). Returns true if usable.
+  calibrate(stats, expected) {
+    const avg = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
+    const calib = {};
+    for (const light of ['light', 'dark']) {
+      const empty = [], white = [], black = [], emptySd = [], occSd = [];
+      for (let i = 0; i < 64; i++) {
+        const isLight = (Math.floor(i / 8) + (i % 8)) % 2 === 0;
+        if ((light === 'light') !== isLight) continue;
+        const e = expected[i];
+        if (!e) { empty.push(stats.mu[i]); emptySd.push(stats.sigma[i]); }
+        else { (e === 'w' ? white : black).push(stats.mu[i]); occSd.push(stats.sigma[i]); }
+      }
+      const eSd = avg(emptySd), oSd = avg(occSd), eMu = avg(empty);
+      if (eSd === null || oSd === null || oSd <= eSd + 2) return false;
+      const wMu = avg(white) ?? eMu + 60, bMu = avg(black) ?? eMu - 60;
+      const pieceMuGap = Math.min(Math.abs(wMu - eMu), Math.abs(bMu - eMu));
+      calib[light] = {
+        sigmaThresh: (eSd + oSd) / 2,
+        emptyMu: eMu,
+        muThresh: Math.max(25, pieceMuGap * 0.6),
+        whiteMu: wMu,
+        blackMu: bMu,
+      };
+    }
+    this._calib = calib;
+    return true;
+  }
+
+  clearCalibration() { this._calib = null; }
 
   diffOccupancy(prev, curr) {
     const vacated = [], arrived = [];
@@ -295,46 +338,115 @@ export class BoardDetector {
   getLastOccupancy() { return this._lastOccupancy; }
 }
 
+// ─── Move matching ───────────────────────────────────────────────────────────
+// Instead of hand-coding capture/castling/en-passant cases, simulate every legal
+// move and score how well the resulting position explains the observed squares.
+
+// chess.board() → 64-array of 'w' | 'b' | null indexed by display index.
+export function expectedFromBoard(boardArray, squareToIndex) {
+  const out = new Array(64).fill(null);
+  for (let rank = 0; rank < 8; rank++) {
+    for (let file = 0; file < 8; file++) {
+      const p = boardArray[rank][file];
+      if (p) out[squareToIndex('abcdefgh'[file] + (8 - rank))] = p.color;
+    }
+  }
+  return out;
+}
+
+function mismatch(observed, expected) {
+  let s = 0;
+  for (let i = 0; i < 64; i++) {
+    const o = observed.occupancy[i], e = expected[i];
+    if (o !== !!e) s += 1;
+    else if (o && observed.colors?.[i] && observed.colors[i] !== e) s += 0.35;
+  }
+  return s;
+}
+
+// Returns { base, ranked: [{move, score}] } where base is the mismatch of
+// "nothing moved" and ranked is sorted best-first.
+export function matchMove(observed, chess, squareToIndex) {
+  const base = mismatch(observed, expectedFromBoard(chess.board(), squareToIndex));
+  const ranked = [];
+  for (const m of chess.moves({ verbose: true })) {
+    if (m.promotion && m.promotion !== 'q') continue;
+    chess.move({ from: m.from, to: m.to, promotion: m.promotion });
+    ranked.push({ move: m, score: mismatch(observed, expectedFromBoard(chess.board(), squareToIndex)) });
+    chess.undo();
+  }
+  ranked.sort((a, b) => a.score - b.score);
+  return { base, ranked };
+}
+
+// Turns a matchMove result into a decision.
+//   { kind: 'none' }                   — board still matches the current position
+//   { kind: 'move', move }             — one clear winner
+//   { kind: 'ambiguous', candidates }  — several moves explain the frame equally
+//   { kind: 'unreadable' }             — nothing explains the frame
+export function decideMove({ base, ranked }) {
+  const best = ranked[0];
+  // A capture changes one square's occupancy plus its colour (1 + 0.35), so 1.3
+  // is the smallest real change; a single misread square (1.0) is ignored.
+  if (!best || base < 1) return { kind: 'none' };
+  if (base < 1.3) {
+    // One square emptied with no colour evidence: could be a capture or a misread.
+    // Never auto-play it; offer the matching captures for confirmation.
+    const weak = ranked.filter(r => r.score <= base - 1 + 1e-9).slice(0, 4).map(r => r.move);
+    return weak.length ? { kind: 'ambiguous', candidates: weak, weak: true } : { kind: 'none' };
+  }
+  // Misreads that persist across positions add equally to every candidate,
+  // so only the improvement over "nothing moved" matters.
+  if (best.score > base - 1.3) return { kind: 'unreadable' };
+  const tied = ranked.filter(r => r.score - best.score < 0.5);
+  if (tied.length === 1) return { kind: 'move', move: best.move };
+  return { kind: 'ambiguous', candidates: tied.slice(0, 4).map(r => r.move) };
+}
+
 // ─── Camera Manager ──────────────────────────────────────────────────────────
 
+// Frames are pulled with grab() from the XR render loop: window
+// requestAnimationFrame is paused on Quest while an immersive session runs.
 export class CameraManager {
   constructor() {
     this._stream = null;
     this._video = null;
     this._canvas = document.createElement('canvas');
     this._ctx = this._canvas.getContext('2d', { willReadFrequently: true });
-    this._running = false;
-    this._frameCallback = null;
   }
 
-  async start(constraints = { video: { facingMode: 'environment', width: 1280, height: 720 } }) {
-    this._stream = await navigator.mediaDevices.getUserMedia(constraints);
+  get ready() { return !!this._video && this._video.readyState >= 2; }
+
+  async start() {
+    if (this._stream) return this;
+    this._stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 960 } },
+      audio: false,
+    });
     this._video = document.createElement('video');
     this._video.srcObject = this._stream;
+    this._video.muted = true;
     this._video.setAttribute('playsinline', '');
     await this._video.play();
-    this._canvas.width = this._video.videoWidth || 1280;
-    this._canvas.height = this._video.videoHeight || 720;
-    this._running = true;
-    this._loop();
+    const vw = this._video.videoWidth || 1280, vh = this._video.videoHeight || 960;
+    const scale = Math.min(1, 640 / vw);
+    this._canvas.width = Math.round(vw * scale);
+    this._canvas.height = Math.round(vh * scale);
     return this;
   }
 
-  _loop() {
-    if (!this._running) return;
-    if (this._video.readyState >= 2) {
-      this._ctx.drawImage(this._video, 0, 0);
-      this._frameCallback?.(this._canvas);
-    }
-    requestAnimationFrame(() => this._loop());
+  grab() {
+    if (!this.ready) return null;
+    this._ctx.drawImage(this._video, 0, 0, this._canvas.width, this._canvas.height);
+    return this._canvas;
   }
 
-  onFrame(cb) { this._frameCallback = cb; }
   getCanvas() { return this._canvas; }
 
   stop() {
-    this._running = false;
     this._stream?.getTracks().forEach(t => t.stop());
+    this._stream = null;
+    this._video = null;
   }
 }
 
