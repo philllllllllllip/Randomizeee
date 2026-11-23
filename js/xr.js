@@ -25,15 +25,14 @@ export class XRSession {
   }
 
   async init() {
-    // Renderer
+    // Renderer — canvas is hidden until XR session starts so it never blocks UI
     this._renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     this._renderer.setPixelRatio(window.devicePixelRatio);
     this._renderer.setSize(window.innerWidth, window.innerHeight);
     this._renderer.xr.enabled = true;
     document.body.appendChild(this._renderer.domElement);
-    this._renderer.domElement.style.position = 'fixed';
-    this._renderer.domElement.style.inset = '0';
-    this._renderer.domElement.style.zIndex = '500';
+    this._renderer.domElement.style.cssText =
+      'position:fixed;inset:0;z-index:500;pointer-events:none;display:none;';
 
     // Scene
     this._scene = new THREE.Scene();
@@ -91,6 +90,11 @@ export class XRSession {
     });
 
     return this;
+  }
+
+  showCanvas() {
+    this._renderer.domElement.style.display = 'block';
+    this._renderer.domElement.style.pointerEvents = 'auto';
   }
 
   createARButton(requiredFeatures = [], optionalFeatures = []) {

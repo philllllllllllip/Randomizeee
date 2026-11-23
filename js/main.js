@@ -67,7 +67,7 @@ async function boot() {
     await state.engine.load((msg) => setProgress(35, msg));
   } catch (err) {
     console.warn('Stockfish load failed:', err);
-    showToast('Engine unavailable — playing without hints', 4000, 'warn');
+    // Non-fatal — app works fully without engine hints
   }
 
   setProgress(70, 'Vision ready');
@@ -115,13 +115,19 @@ function startMode(mode) {
   state.mode = mode;
 
   if (mode === 'manual') {
-    // Manual mode works without XR too
-    if (!navigator.xr) {
+    // Manual mode works without XR — fall back to desktop board
+    const hasXR = await navigator.xr?.isSessionSupported('immersive-ar').catch(() => false);
+    if (!hasXR) {
       startDesktopManual();
       return;
     }
     startXRMode('manual');
   } else {
+    const hasXR = await navigator.xr?.isSessionSupported('immersive-ar').catch(() => false);
+    if (!hasXR) {
+      startDesktopManual(); // physical mode degrades to desktop board
+      return;
+    }
     startXRMode('physical');
   }
 }
@@ -135,9 +141,10 @@ function startXRMode(modeName) {
   `;
   document.body.appendChild(arButton);
 
-  // When XR session starts
+  // When XR session starts, show the canvas and launch the mode
   state.xr.renderer.xr.addEventListener('sessionstart', () => {
     arButton.remove();
+    state.xr.showCanvas();
     launchMode(modeName);
   });
 }

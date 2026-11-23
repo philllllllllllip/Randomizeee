@@ -1,9 +1,9 @@
 // Stockfish WASM wrapper — loads the engine in a Web Worker via Blob URL
 // Provides async getBestMove(fen, depth, movetime) → {move, score}
 
-const STOCKFISH_CDN = 'https://cdn.jsdelivr.net/npm/stockfish@16.0.0/src/stockfish-nnue-16-single.js';
-// Fallback: smaller non-NNUE build
-const STOCKFISH_FALLBACK = 'https://cdn.jsdelivr.net/npm/stockfish@11.0.0/stockfish.js';
+// Pure-JS Stockfish 11 — no WASM, works as a Blob Worker in all browsers
+const STOCKFISH_CDN = 'https://cdn.jsdelivr.net/npm/stockfish@11.0.0/stockfish.js';
+const STOCKFISH_FALLBACK = 'https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js';
 
 export class StockfishEngine {
   constructor() {
@@ -39,13 +39,16 @@ export class StockfishEngine {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Stockfish init timeout')), 20000);
       this._worker.onmessage = (e) => {
-        const line = typeof e.data === 'string' ? e.data : (e.data?.text ?? '');
-        if (line.startsWith('Stockfish') || line.includes('uciok')) {
-          clearTimeout(timeout);
-          this._ready = true;
-          this._worker.onmessage = (ev) => this._handleMessage(ev);
-          onProgress?.('Stockfish ready');
-          resolve(this);
+        const line = typeof e.data === 'string' ? e.data : (e.data?.text ?? String(e.data ?? ''));
+        // Stockfish 11 returns 'uciok' after the 'uci' command
+        if (line.includes('uciok') || line.startsWith('Stockfish') || line.startsWith('id name')) {
+          if (line.includes('uciok')) {
+            clearTimeout(timeout);
+            this._ready = true;
+            this._worker.onmessage = (ev) => this._handleMessage(ev);
+            onProgress?.('Stockfish ready');
+            resolve(this);
+          }
         }
       };
       this._worker.onerror = (err) => { clearTimeout(timeout); reject(err); };
