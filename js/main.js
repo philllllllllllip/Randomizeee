@@ -1,33 +1,14 @@
 // Board Coach XR — main entry point
-// Orchestrates loading, mode selection, XR session, game state, and engine
+// Three.js / XRSession is loaded dynamically (only on "Start AR") so the
+// landing page renders immediately without any CDN round-trip at boot.
 
-import { XRSession } from './xr.js';
 import { ChessGame } from './game.js';
 import { StockfishEngine } from './engine.js';
-import { loadOpenCV } from './vision.js';
 import { PhysicalBoardMode } from './modes/physical.js';
 import { ManualBoardMode } from './modes/manual.js';
 import { DesktopBoard, showToast } from './ui.js';
 
-// ─── Load chess.js from CDN ───────────────────────────────────────────────────
-async function loadChessJS() {
-  return new Promise((resolve, reject) => {
-    if (typeof Chess !== 'undefined') { resolve(); return; }
-    const s = document.createElement('script');
-    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js';
-    s.onload = resolve;
-    s.onerror = () => {
-      // Try alternate CDN
-      const s2 = document.createElement('script');
-      s2.src = 'https://cdn.jsdelivr.net/npm/chess.js@0.10.3/chess.js';
-      s2.onload = resolve;
-      s2.onerror = reject;
-      document.head.appendChild(s2);
-    };
-    document.head.appendChild(s);
-  });
-}
-
+// ─── Progress helpers ─────────────────────────────────────────────────────────
 function setProgress(pct, msg) {
   const fill = document.getElementById('loader-fill');
   const status = document.getElementById('loader-status');
@@ -47,8 +28,8 @@ function hideLoading() {
 const state = {
   game: new ChessGame(),
   engine: new StockfishEngine(),
-  xr: null,
-  mode: null, // 'physical' | 'manual'
+  xr: null,          // created lazily on "Start AR"
+  mode: null,
   modeInstance: null,
   playerColor: 'w',
   engineDepth: 15,
@@ -56,38 +37,37 @@ const state = {
   engineBusy: false,
 };
 
-// ─── Boot sequence ────────────────────────────────────────────────────────────
+// ─── Boot — runs immediately, never waits for CDN ────────────────────────────
 async function boot() {
-  setProgress(5, 'Loading chess.js…');
-  await loadChessJS();
-  state.game.init();
-
-  setProgress(20, 'Loading Stockfish…');
-  try {
-    await state.engine.load((msg) => setProgress(35, msg));
-  } catch (err) {
-    console.warn('Stockfish load failed:', err);
-    // Non-fatal — app works fully without engine hints
+  // chess.js is a local <script> tag — available synchronously
+  setProgress(10, 'Starting up…');
+  if (typeof Chess === 'undefined') {
+    // Shouldn't happen but guard anyway
+    setProgress(10, 'chess.js not found — check js/lib/chess.js');
+    return;
   }
+  state.game.init();
+  setProgress(40, 'Chess engine ready');
 
-  setProgress(70, 'Vision ready');
+  // Stockfish loads in the background — non-blocking, non-fatal
+  setProgress(70, 'Loading Stockfish (background)…');
+  state.engine.load((msg) => {
+    // Keep status updated but don't block UI
+    const status = document.getElementById('loader-status');
+    if (status && document.getElementById('loading-screen')) status.textContent = msg;
+  }).catch((err) => {
+    console.warn('Stockfish unavailable:', err.message);
+  });
 
-  setProgress(85, 'Setting up XR…');
-  const xr = new XRSession();
-  await xr.init();
-  state.xr = xr;
-  xr.startRenderLoop();
-
-  setProgress(100, 'Ready');
-  setTimeout(hideLoading, 400);
-
-  // Check WebXR support
+  setProgress(90, 'Checking WebXR…');
   const xrSupported = await navigator.xr?.isSessionSupported('immersive-ar').catch(() => false);
   if (!xrSupported) {
     document.getElementById('browser-warning')?.classList.remove('hidden');
   }
 
-  // Show landing
+  setProgress(100, 'Ready');
+  setTimeout(hideLoading, 300);
+
   document.getElementById('landing')?.classList.remove('hidden');
   setupLandingUI();
   setupDesktopFallback();
@@ -102,51 +82,60 @@ function setupLandingUI() {
     state.engineDepth = parseInt(e.target.value);
   });
 
-  document.getElementById('btn-physical')?.addEventListener('click', () => {
-    startMode('physical');
-  });
-  document.getElementById('btn-manual')?.addEventListener('click', () => {
-    startMode('manual');
-  });
+  document.getElementById('btn-physical')?.addEventListener('click', () => startMode('physical'));
+  document.getElementById('btn-manual')?.addEventListener('click', () => startMode('manual'));
 }
 
-function startMode(mode) {
+async function startMode(mode) {
   document.getElementById('landing')?.classList.add('hidden');
   state.mode = mode;
 
-  if (mode === 'manual') {
-    // Manual mode works without XR — fall back to desktop board
-    const hasXR = await navigator.xr?.isSessionSupported('immersive-ar').catch(() => false);
-    if (!hasXR) {
-      startDesktopManual();
-      return;
-    }
-    startXRMode('manual');
-  } else {
-    const hasXR = await navigator.xr?.isSessionSupported('immersive-ar').catch(() => false);
-    if (!hasXR) {
-      startDesktopManual(); // physical mode degrades to desktop board
-      return;
-    }
-    startXRMode('physical');
+  const xrSupported = await navigator.xr?.isSessionSupported('immersive-ar').catch(() => false);
+  if (!xrSupported) {
+    startDesktopFallback();
+    return;
   }
+  await startXRMode(mode);
 }
 
-function startXRMode(modeName) {
-  const arButton = state.xr.createARButton();
-  arButton.style.cssText = `
-    position:fixed; bottom:40px; left:50%; transform:translateX(-50%);
-    padding:14px 32px; background:#4a9eff; color:#fff; border:none;
-    border-radius:8px; font-size:16px; font-weight:700; cursor:pointer; z-index:600;
-  `;
-  document.body.appendChild(arButton);
+// Three.js and XRSession are loaded here — only when the user actually
+// enters AR, so the landing page never waits for CDN traffic.
+async function startXRMode(modeName) {
+  // Show a small loading overlay while Three.js downloads
+  const overlay = document.createElement('div');
+  overlay.style.cssText =
+    'position:fixed;inset:0;background:#000a;color:#fff;display:flex;' +
+    'align-items:center;justify-content:center;font-size:20px;z-index:800;';
+  overlay.textContent = 'Loading AR… (first time ~2 s)';
+  document.body.appendChild(overlay);
 
-  // When XR session starts, show the canvas and launch the mode
-  state.xr.renderer.xr.addEventListener('sessionstart', () => {
-    arButton.remove();
-    state.xr.showCanvas();
-    launchMode(modeName);
-  });
+  try {
+    const { XRSession } = await import('./xr.js');
+    const xr = new XRSession();
+    await xr.init();
+    state.xr = xr;
+    xr.startRenderLoop();
+
+    overlay.remove();
+
+    const arButton = xr.createARButton();
+    arButton.style.cssText =
+      'position:fixed;bottom:40px;left:50%;transform:translateX(-50%);' +
+      'padding:14px 32px;background:#4a9eff;color:#fff;border:none;' +
+      'border-radius:8px;font-size:16px;font-weight:700;cursor:pointer;z-index:600;';
+    document.body.appendChild(arButton);
+
+    xr.renderer.xr.addEventListener('sessionstart', () => {
+      arButton.remove();
+      xr.showCanvas();
+      launchMode(modeName);
+    });
+  } catch (err) {
+    overlay.remove();
+    console.error('XR init failed:', err);
+    showToast('AR unavailable — using desktop board');
+    startDesktopFallback();
+  }
 }
 
 function launchMode(modeName) {
@@ -155,8 +144,7 @@ function launchMode(modeName) {
   engine.newGame?.();
   xr.clearHighlights?.();
   xr.clearArrow?.();
-
-  state.modeInstance?.stop();
+  state.modeInstance?.stop?.();
 
   if (modeName === 'physical') {
     state.modeInstance = new PhysicalBoardMode(game, engine, xr, onMoveConfirmed);
@@ -166,13 +154,11 @@ function launchMode(modeName) {
     state.modeInstance.start({ playerColor: state.playerColor });
   }
 
-  xr.onFrame((_time, _frame) => {
-    updateXRHUD();
-  });
+  xr.onFrame((_time, _frame) => { /* XR HUD updates if needed */ });
 }
 
 // ─── Move Confirmed Callback ──────────────────────────────────────────────────
-async function onMoveConfirmed(move) {
+async function onMoveConfirmed(_move) {
   updateDesktopBoard();
 
   if (state.game.isGameOver()) {
@@ -180,13 +166,13 @@ async function onMoveConfirmed(move) {
     return;
   }
 
-  // Show Stockfish hint on the player's turn
   const isPlayerTurn = state.game.turn() === state.playerColor;
   if (isPlayerTurn && !state.engineBusy) {
     requestEngineHint();
   } else {
-    state.xr.clearArrow?.();
-    document.getElementById('desktop-move-hint').textContent = '';
+    state.xr?.clearArrow?.();
+    const el = document.getElementById('desktop-move-hint');
+    if (el) el.textContent = '';
   }
 }
 
@@ -199,7 +185,7 @@ async function requestEngineHint() {
     if (!move || move === '(none)') return;
     const from = move.slice(0, 2);
     const to = move.slice(2, 4);
-    state.xr.showArrow?.(from, to);
+    state.xr?.showArrow?.(from, to);
     updateMoveHintUI(move, score);
   } catch (err) {
     console.warn('Engine error:', err);
@@ -219,22 +205,12 @@ function updateMoveHintUI(uciMove, score) {
 
 function getGameOverReason() {
   const g = state.game.chess;
-  if (g.isCheckmate()) return 'Checkmate!';
-  if (g.isStalemate()) return 'Stalemate';
-  if (g.isInsufficientMaterial()) return 'Draw — insufficient material';
-  if (g.isThreefoldRepetition()) return 'Draw — threefold repetition';
-  if (g.isDraw()) return 'Draw';
+  if (g.in_checkmate()) return 'Checkmate!';
+  if (g.in_stalemate()) return 'Stalemate';
+  if (g.insufficient_material()) return 'Draw — insufficient material';
+  if (g.in_threefold_repetition()) return 'Draw — threefold repetition';
+  if (g.in_draw()) return 'Draw';
   return 'Game over';
-}
-
-// ─── XR HUD ───────────────────────────────────────────────────────────────────
-function updateXRHUD() {
-  // Keep board overlay updated with current piece positions
-  if (!state.xr.boardGroup?.visible) return;
-  const board = state.game.boardArray();
-  if (!board) return;
-  // Piece rendering inside XR happens via the highlight system + text sprites
-  // Full 3D piece models would require additional assets
 }
 
 // ─── Desktop Fallback ─────────────────────────────────────────────────────────
@@ -247,16 +223,17 @@ function setupDesktopFallback() {
     if (state.modeInstance?.undo) {
       state.modeInstance.undo();
     } else {
-      const move = state.game.undo();
-      if (move) { updateDesktopBoard(); }
+      state.game.undo();
+      updateDesktopBoard();
     }
   });
   document.getElementById('btn-new-game')?.addEventListener('click', () => {
     state.game.reset();
     state.engine.newGame?.();
     updateDesktopBoard();
-    state.xr.clearArrow?.();
-    document.getElementById('desktop-move-hint').textContent = '';
+    state.xr?.clearArrow?.();
+    const el = document.getElementById('desktop-move-hint');
+    if (el) el.textContent = '';
   });
   document.getElementById('btn-flip')?.addEventListener('click', () => {
     state.desktopBoard.flip();
@@ -273,7 +250,6 @@ function setupDesktopFallback() {
     updateDesktopBoard();
   });
 
-  // Click-to-move for desktop board
   let selectedFrom = null;
   state.desktopBoard.onClick((sq) => {
     if (!selectedFrom) {
@@ -288,16 +264,14 @@ function setupDesktopFallback() {
     } else {
       if (state.game.isLegal(selectedFrom, sq)) {
         const prom = document.getElementById('promotion-panel');
-        const needProm = (() => {
-          const p = state.game.pieceAt(selectedFrom);
-          return p?.type === 'p' && ((p.color === 'w' && sq[1] === '8') || (p.color === 'b' && sq[1] === '1'));
-        })();
+        const p = state.game.pieceAt(selectedFrom);
+        const needProm = p?.type === 'p' &&
+          ((p.color === 'w' && sq[1] === '8') || (p.color === 'b' && sq[1] === '1'));
         if (needProm) {
           prom?.classList.remove('hidden');
           const { from, to } = { from: selectedFrom, to: sq };
           selectedFrom = null;
-          const buttons = document.querySelectorAll('.promo-btn');
-          for (const btn of buttons) {
+          for (const btn of document.querySelectorAll('.promo-btn')) {
             btn.onclick = () => {
               prom?.classList.add('hidden');
               state.game.applyMove(from, to, btn.dataset.piece);
@@ -317,7 +291,7 @@ function setupDesktopFallback() {
   });
 }
 
-function startDesktopManual() {
+function startDesktopFallback() {
   document.getElementById('desktop-hud')?.classList.remove('hidden');
   updateDesktopBoard();
   onMoveConfirmed(null);
@@ -326,7 +300,8 @@ function startDesktopManual() {
 function updateDesktopBoard() {
   if (!state.desktopBoard) return;
   const fen = state.game.fen();
-  document.getElementById('desktop-fen-display').textContent = fen;
+  const el = document.getElementById('desktop-fen-display');
+  if (el) el.textContent = fen;
   state.desktopBoard.render(state.game.boardArray());
 }
 

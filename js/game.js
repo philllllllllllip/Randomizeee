@@ -22,9 +22,9 @@ export class ChessGame {
 
   turn() { return this._chess.turn(); } // 'w' or 'b'
 
-  isGameOver() { return this._chess.isGameOver(); }
+  isGameOver() { return this._chess.game_over(); }
 
-  inCheck() { return this._chess.inCheck(); }
+  inCheck() { return this._chess.in_check(); }
 
   // Returns array of {from, to, san, flags} for all legal moves
   legalMoves(square) {
